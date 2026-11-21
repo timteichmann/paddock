@@ -16,7 +16,9 @@ readonly INSTANCES_DIR="$CONFIG_DIR/instances"
 readonly LABEL_KEY="paddock.instance"
 readonly PROXY_PORT=3128
 readonly PROXY_IMAGE="localhost/paddock-proxy:latest"
-readonly AGENT_IMAGE_REPO="localhost/paddock-agent"
+readonly BASE_IMAGE="localhost/paddock-base:latest"
+readonly AGENT_IMAGE_PREFIX="localhost/paddock-"   # + <tool>:<version>
+DATA_DIR=""
 readonly NAME_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 # exact:  label(.label)+      wildcard: .label(.label)+
 # Last label must start with a letter, so IPv4 literals are rejected.
@@ -52,21 +54,33 @@ confirm() {
 
 # ----------------------------------------------------------------- config --
 
-# Defaults; overridable in $CONFIG_DIR/config (KEY=VALUE, not sourced).
-declare -A CFG=(
-  [agent_version]=""
-  [agent_memory]="4g"
-  [agent_cpus]="2"
-  [agent_pids_limit]="2048"
-  [proxy_memory]="256m"
-  [proxy_cpus]="0.5"
-  [proxy_pids_limit]="256"
-  [relabel]=""          # "", "z" or "Z" (SELinux relabel of bind mounts)
-)
+# Shipped defaults (config, domains, Containerfiles, tool definitions) live in
+# the data dir. A file at the same relative path under $CONFIG_DIR replaces
+# the shipped one; `config` is merged key by key instead.
+find_data_dir() {
+  local self d
+  self=$(realpath -- "${BASH_SOURCE[0]}")
+  for d in ${PADDOCK_DATA_DIR:+"$PADDOCK_DATA_DIR"} "$(dirname "$self")/share" \
+           "${XDG_DATA_HOME:-$HOME/.local/share}/paddock" /usr/local/share/paddock /usr/share/paddock; do
+    [[ -f $d/config && -d $d/tools ]] && { printf '%s' "$d"; return 0; }
+  done
+  die "paddock data dir not found (set PADDOCK_DATA_DIR or install share/ to ~/.local/share/paddock)"
+}
 
-load_config() {
-  local f="$CONFIG_DIR/config" line key val n=0
-  [[ -f $f ]] || return 0
+# Path of a data file: the user's override if present, else the shipped file.
+# Prints nothing (and fails) if neither exists.
+data_file() {
+  local rel=$1
+  if [[ -f $CONFIG_DIR/$rel ]]; then printf '%s' "$CONFIG_DIR/$rel"
+  elif [[ -f $DATA_DIR/$rel ]]; then printf '%s' "$DATA_DIR/$rel"
+  else return 1; fi
+}
+
+# Parse KEY=VALUE lines of $1 into the associative array named $2. With
+# $3 = new, unknown keys are added; otherwise they are an error.
+parse_kv() {
+  local f=$1 mode=${3-} line key val n=0
+  local -n kv=$2
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     line="${line%%#*}"
@@ -74,104 +88,63 @@ load_config() {
     [[ -z $line ]] && continue
     [[ $line == *=* ]] || die "$f:$n: expected KEY=VALUE"
     key="${line%%=*}"; val="${line#*=}"
-    [[ -v CFG[$key] ]] || die "$f:$n: unknown setting '$key'"
-    CFG[$key]=$val
+    [[ $key =~ ^[a-z0-9_]+$ ]] || die "$f:$n: invalid key '$key'"
+    [[ $mode == new || -v kv[$key] ]] || die "$f:$n: unknown setting '$key'"
+    kv["$key"]=$val
   done <"$f"
-  [[ ${CFG[relabel]} =~ ^[zZ]?$ ]] || die "$f: relabel must be empty, 'z' or 'Z'"
-  local k
-  for k in agent_pids_limit proxy_pids_limit; do
-    [[ ${CFG[$k]} =~ ^[0-9]*$ ]] || die "$f: $k must be a number or empty"
-  done
 }
 
-set_config() { # key value
-  local f="$CONFIG_DIR/config" key=$1 val=$2
-  { [[ -f $f ]] && grep -v "^[[:space:]]*$key=" "$f"; printf '%s=%s\n' "$key" "$val"; } \
-    | atomic_write "$f" 0644
-  CFG[$key]=$val
+declare -A CFG=()
+load_config() {
+  parse_kv "$DATA_DIR/config" CFG new
+  [[ -f $CONFIG_DIR/config ]] && parse_kv "$CONFIG_DIR/config" CFG
+  [[ ${CFG[relabel]-} =~ ^[zZ]?$ ]] || die "config: relabel must be empty, 'z' or 'Z'"
+  local k
+  for k in agent_pids_limit proxy_pids_limit; do
+    [[ ${CFG[$k]-} =~ ^[0-9]*$ ]] || die "config: $k must be a number or empty"
+  done
 }
 
 init_config_dir() {
   umask 077
   mkdir -p "$INSTANCES_DIR"
   chmod 700 "$CONFIG_DIR"
-  [[ -f $CONFIG_DIR/base-domains.txt ]] || write_default_base_domains
-  [[ -f $CONFIG_DIR/Containerfile.agent ]] || write_default_containerfile_agent
-  [[ -f $CONFIG_DIR/Containerfile.proxy ]] || write_default_containerfile_proxy
-  [[ -f $CONFIG_DIR/config ]] || write_default_config
   umask 022
+  DATA_DIR=$(find_data_dir)
   load_config
 }
 
-write_default_config() {
-  cat >"$CONFIG_DIR/config" <<'EOF'
-# paddock settings (KEY=VALUE). Empty value disables a limit.
-# agent_version is set by `paddock build`.
-agent_memory=4g
-agent_cpus=2
-agent_pids_limit=2048
-proxy_memory=256m
-proxy_cpus=0.5
-proxy_pids_limit=256
-# SELinux relabel flag for bind mounts: empty (Arch default), z or Z.
-relabel=
-EOF
+# Built image version per tool, in $CONFIG_DIR/images (tool=version).
+tool_version() {
+  local f="$CONFIG_DIR/images"
+  [[ -f $f ]] || return 0
+  sed -n "s/^$1=//p" "$f" | tail -n1
 }
 
-write_default_base_domains() {
-  cat >"$CONFIG_DIR/base-domains.txt" <<'EOF'
-# Domains every paddock instance may reach.
-# Syntax: example.com (exact) or .example.com (domain and all subdomains).
-api.anthropic.com
-claude.ai
-platform.claude.com
-EOF
+set_tool_version() { # tool version
+  local f="$CONFIG_DIR/images"
+  { [[ -f $f ]] && grep -v "^$1=" "$f"; printf '%s=%s\n' "$1" "$2"; } | atomic_write "$f" 0644
 }
 
-write_default_containerfile_agent() {
-  cat >"$CONFIG_DIR/Containerfile.agent" <<'EOF'
-# paddock agent image. Built by `paddock build [--version X]`.
-ARG BASE_IMAGE=docker.io/library/archlinux:latest
-FROM ${BASE_IMAGE}
-
-ARG CLAUDE_CODE_VERSION
-RUN test -n "$CLAUDE_CODE_VERSION" || { echo "CLAUDE_CODE_VERSION build arg is required" >&2; exit 1; }
-
-RUN pacman -Syu --noconfirm --needed \
-      bash ca-certificates curl git less nodejs npm procps-ng python ripgrep \
- && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
-
-# Current npm blocks install scripts by default; Claude Code's postinstall
-# links its platform-native binary, so allow scripts for that package only.
-RUN npm install -g --no-fund --no-audit --allow-scripts=@anthropic-ai/claude-code \
-      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
- && npm cache clean --force \
- && claude --version
-
-# No sudo (not in the base image); strip setuid/setgid bits. git is for local
-# commits/diffs only: push and pull happen on the host, not in the instance.
-RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
- && mkdir -p /home/agent /workspace && chmod 0777 /home/agent
-
-ENV HOME=/home/agent \
-    DISABLE_AUTOUPDATER=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-WORKDIR /workspace
-LABEL paddock.image=agent
-CMD ["sleep", "infinity"]
-EOF
+# Tools with a tool.conf in the data dir or the config dir.
+list_tools() {
+  local d
+  for d in "$DATA_DIR"/tools/*/ "$CONFIG_DIR"/tools/*/; do
+    [[ -f $d/tool.conf ]] && basename "$d"
+  done | sort -u
 }
 
-write_default_containerfile_proxy() {
-  cat >"$CONFIG_DIR/Containerfile.proxy" <<'EOF'
-# paddock proxy image: Squid only. Config is mounted per instance at runtime.
-ARG BASE_IMAGE=docker.io/library/archlinux:latest
-FROM ${BASE_IMAGE}
-RUN pacman -Syu --noconfirm --needed squid \
- && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
-LABEL paddock.image=proxy
-CMD ["squid", "-N", "-f", "/etc/paddock/squid.conf"]
-EOF
+# Load tools/<tool>/tool.conf into TOOL.
+declare -A TOOL=()
+load_tool() {
+  local t=$1 f
+  [[ $t =~ $NAME_RE && $t != base && $t != proxy ]] || die "invalid tool name '$t'"
+  f=$(data_file "tools/$t/tool.conf") \
+    || die "unknown tool '$t' (available: $(list_tools | paste -sd' '))"
+  TOOL=([command]="" [yolo_args]="" [npm_package]="")
+  parse_kv "$f" TOOL
+  [[ -n ${TOOL[command]} ]] || die "$f: command is required"
+  TOOL[name]=$t
 }
 
 # --------------------------------------------------------------- validate --
@@ -262,16 +235,24 @@ ctr_exists() { podman container exists "$1"; }
 ctr_state()  { podman container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
 ctr_running() { [[ $(ctr_state "$1") == running ]]; }
 
-agent_image() {
-  [[ -n ${CFG[agent_version]} ]] || die "no agent image built yet; run 'paddock build' first"
-  printf '%s:%s' "$AGENT_IMAGE_REPO" "${CFG[agent_version]}"
+instance_tool() {
+  local t
+  t=$(cat "$(instance_dir "$1")/tool" 2>/dev/null) || die "instance '$1' has no tool file"
+  [[ $t =~ $NAME_RE ]] || die "instance '$1' has an invalid tool '$t'"
+  printf '%s' "$t"
 }
 
-require_images() {
+agent_image() { # tool
+  local v; v=$(tool_version "$1")
+  [[ -n $v ]] || die "no image built for tool '$1' yet; run 'paddock build $1' first"
+  printf '%s%s:%s' "$AGENT_IMAGE_PREFIX" "$1" "$v"
+}
+
+require_images() { # tool
   local img
-  img=$(agent_image)
-  podman image exists "$img" || die "agent image $img not found; run 'paddock build --version ${CFG[agent_version]}'"
-  podman image exists "$PROXY_IMAGE" || die "proxy image $PROXY_IMAGE not found; run 'paddock build'"
+  img=$(agent_image "$1")
+  podman image exists "$img" || die "agent image $img not found; run 'paddock build $1 --version $(tool_version "$1")'"
+  podman image exists "$PROXY_IMAGE" || die "proxy image $PROXY_IMAGE not found; run 'paddock build $1'"
 }
 
 ip2int() {
@@ -340,18 +321,34 @@ remove_podman_objects() {
 
 # ------------------------------------------------------------ proxy config --
 
+# Domains by source: "base", "tool" or "instance" ($2), for instance $1.
+domains_from() {
+  local f
+  case $2 in
+    base)     f=$(data_file domains.txt) || return 0 ;;
+    tool)     f=$(data_file "tools/$(instance_tool "$1")/domains.txt") || return 0 ;;
+    instance) f="$(instance_dir "$1")/domains.txt" ;;
+  esac
+  read_domains "$f"
+}
+
+allowed_domains() {
+  local src
+  for src in base tool instance; do domains_from "$1" "$src" || return 1; done
+}
+
 generate_proxy_config() {
   local name=$1 dir pdir ip subnet
   dir=$(instance_dir "$name"); pdir="$dir/proxy"
   mkdir -p "$pdir"; chmod 755 "$pdir"
   ip=$(proxy_ip "$name"); subnet=$(int_subnet "$name")
 
-  local base inst
-  base=$(read_domains "$CONFIG_DIR/base-domains.txt") || exit 1
-  inst=$(read_domains "$dir/domains.txt") || exit 1
+  local tool all
+  tool=$(instance_tool "$name")
+  all=$(allowed_domains "$name") || exit 1
   {
-    printf '# generated by paddock: base-domains.txt + instances/%s/domains.txt\n' "$name"
-    printf '%s\n%s\n' "$base" "$inst" | sed '/^$/d' | dedupe_domains
+    printf '# generated by paddock: domains.txt + tools/%s/domains.txt + instances/%s/domains.txt\n' "$tool" "$name"
+    printf '%s\n' "$all" | sed '/^$/d' | dedupe_domains
     # never empty: Squid rejects an empty dstdomain file
     printf 'paddock.invalid\n'
   } | atomic_write "$pdir/allowlist.txt" 0644
@@ -445,7 +442,8 @@ wait_proxy_ready() {
 # ------------------------------------------------------------- containers --
 
 create_containers() {
-  local name=$1 ws ip uid gid
+  local name=$1 ws ip uid gid tool envf
+  tool=$(instance_tool "$name")
   ws=$(<"$(instance_dir "$name")/workspace")
   [[ -d $ws ]] || die "workspace $ws does not exist"
   ip=$(proxy_ip "$name")
@@ -470,9 +468,12 @@ create_containers() {
     -v "$(instance_dir "$name")/proxy:/etc/paddock:$(mount_opt ro)" \
     "$PROXY_IMAGE" >/dev/null
 
+  local -a tenv=()
+  if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
   local purl
   purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
   podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
+    --label "paddock.tool=$tool" \
     --hostname "$name" \
     --network "$(int_net "$name")" \
     --dns=none \
@@ -485,10 +486,9 @@ create_containers() {
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
     -e HTTP_PROXY="$purl"  -e http_proxy="$purl" \
     -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
-    -e DISABLE_AUTOUPDATER=1 \
-    -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-    -e PADDOCK_INSTANCE="$name" \
-    "$(agent_image)" sleep infinity >/dev/null
+    "${tenv[@]}" \
+    -e PADDOCK_INSTANCE="$name" -e PADDOCK_TOOL="$tool" \
+    "$(agent_image "$tool")" sleep infinity >/dev/null
 }
 
 create_networks_and_volume() {
@@ -538,16 +538,18 @@ term_env_args() {
 # --------------------------------------------------------------- commands --
 
 cmd_create() {
-  local name="" path="" domains_csv=""
+  local tool="" name="" path="" domains_csv=""
   while (($#)); do
     case $1 in
       --domains) (($# >= 2)) || die "--domains needs a value"; domains_csv=$2; shift 2 ;;
       --domains=*) domains_csv=${1#*=}; shift ;;
       -*) die "unknown option '$1'" ;;
-      *) if [[ -z $name ]]; then name=$1; elif [[ -z $path ]]; then path=$1; else die "unexpected argument '$1'"; fi; shift ;;
+      *) if [[ -z $tool ]]; then tool=$1; elif [[ -z $name ]]; then name=$1
+         elif [[ -z $path ]]; then path=$1; else die "unexpected argument '$1'"; fi; shift ;;
     esac
   done
-  [[ -n $name && -n $path ]] || die "usage: paddock create <name> <path> [--domains d1,d2,...]"
+  [[ -n $tool && -n $name && -n $path ]] || die "usage: paddock create <tool> <name> <path> [--domains d1,d2,...]"
+  load_tool "$tool"
   validate_name "$name"
   local dir; dir=$(instance_dir "$name")
   [[ -e $dir ]] && die "instance '$name' already exists"
@@ -566,7 +568,7 @@ cmd_create() {
     done
   fi
 
-  require_images
+  require_images "$tool"
 
   local ws
   ws=$(check_workspace_path "$path")
@@ -578,6 +580,7 @@ cmd_create() {
   trap 'rc=$?; if ((rc)); then warn "create failed, rolling back"; remove_podman_objects "'"$name"'"; rm -rf -- "'"$dir"'"; fi' EXIT
   mkdir -p "$dir"
   printf '%s\n' "$ws" | atomic_write "$dir/workspace" 0644
+  printf '%s\n' "$tool" | atomic_write "$dir/tool" 0644
   { printf '# extra domains for instance %s (example.com or .example.com)\n' "$name"
     if ((${#domains[@]})); then printf '%s\n' "${domains[@]}" | sort -u; fi
   } | atomic_write "$dir/domains.txt" 0644
@@ -585,12 +588,13 @@ cmd_create() {
   create_networks_and_volume "$name"
   create_containers "$name"
   trap - EXIT
-  info "created instance '$name' (workspace $ws). Start it with: paddock start $name"
+  info "created $tool instance '$name' (workspace $ws). Start it with: paddock start $name"
 }
 
 cmd_recreate() {
   (($# == 1)) || die "usage: paddock recreate <name>"
-  local name=$1; require_instance "$name"; require_images
+  local name=$1 tool; require_instance "$name"
+  tool=$(instance_tool "$name"); load_tool "$tool"; require_images "$tool"
   local c
   for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
     ctr_exists "$c" && podman rm -f -t 5 "$c" >/dev/null
@@ -605,7 +609,7 @@ cmd_recreate() {
   podman volume exists "$(home_vol "$name")" \
     || podman volume create --label "$LABEL_KEY=$name" "$(home_vol "$name")" >/dev/null
   create_containers "$name"
-  info "recreated containers for '$name' with $(agent_image) (home volume kept)"
+  info "recreated containers for '$name' with $(agent_image "$tool") (home volume kept)"
 }
 
 cmd_start() {
@@ -631,21 +635,26 @@ cmd_attach() {
     case $1 in
       --yolo) yolo=1; shift ;;
       --) shift; cargs=("$@"); break ;;
-      -*) die "unknown option '$1' (pass claude arguments after --)" ;;
+      -*) die "unknown option '$1' (pass tool arguments after --)" ;;
       *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1; shift ;;
     esac
   done
-  [[ -n $name ]] || die "usage: paddock attach <name> [--yolo] [-- claude args]"
+  [[ -n $name ]] || die "usage: paddock attach <name> [--yolo] [-- tool args]"
   require_instance "$name"
-  start_instance "$name"
+  load_tool "$(instance_tool "$name")"
   if ((yolo)); then
-    printf '\033[1;31mWARNING:\033[0m --yolo runs Claude Code with --dangerously-skip-permissions.\n' >&2
+    [[ -n ${TOOL[yolo_args]} ]] || die "tool '${TOOL[name]}' has no --yolo mode (yolo_args is empty)"
+    local -a yargs; read -r -a yargs <<<"${TOOL[yolo_args]}"
+    start_instance "$name"
+    printf '\033[1;31mWARNING:\033[0m --yolo runs %s with %s.\n' "${TOOL[command]}" "${TOOL[yolo_args]}" >&2
     printf 'It will run commands and edit files in %s without asking.\n' "$(<"$(instance_dir "$name")/workspace")" >&2
-    cargs=(--dangerously-skip-permissions "${cargs[@]}")
+    cargs=("${yargs[@]}" "${cargs[@]}")
+  else
+    start_instance "$name"
   fi
   local TTY_FLAG; set_tty_flag
   local -a tenvs; mapfile -t tenvs < <(term_env_args "$(agent_ctr "$name")")
-  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
+  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "$(agent_ctr "$name")" "${TOOL[command]}" "${cargs[@]}"
 }
 
 cmd_shell() {
@@ -686,8 +695,8 @@ cmd_rm() {
 
 cmd_list() {
   (($# == 0)) || die "usage: paddock list"
-  local dir name ws state a p n
-  printf '%-32s %-10s %-7s %s\n' NAME STATE DOMAINS WORKSPACE
+  local dir name ws state a p n tool
+  printf '%-32s %-10s %-10s %-7s %s\n' NAME STATE TOOL DOMAINS WORKSPACE
   for dir in "$INSTANCES_DIR"/*/; do
     name=$(basename "$dir")
     [[ $name =~ $NAME_RE ]] || continue
@@ -696,8 +705,9 @@ cmd_list() {
     if [[ $a == "$p" ]]; then state=$a
     elif [[ $a == running || $p == running ]]; then state=partial
     else state=$a; fi
+    tool=$(cat "$dir/tool" 2>/dev/null || echo '?')
     n=$(read_domains "$dir/domains.txt" 2>/dev/null | grep -c . || true)
-    printf '%-32s %-10s %-7s %s\n' "$name" "$state" "$n" "$ws"
+    printf '%-32s %-10s %-10s %-7s %s\n' "$name" "$state" "$tool" "$n" "$ws"
   done
 }
 
@@ -716,8 +726,10 @@ cmd_domains() {
   case $sub in
     list)
       (($# == 0)) || die "usage: paddock domains <name> list"
-      read_domains "$CONFIG_DIR/base-domains.txt" | sort -u | sed 's/^/base      /'
-      read_domains "$f" | sort -u | sed 's/^/instance  /'
+      local src
+      for src in base tool instance; do
+        domains_from "$name" "$src" | sort -u | sed "s/^/$(printf '%-9s ' "$src")/"
+      done
       ;;
     add|rm)
       (($#)) || die "usage: paddock domains <name> $sub <domain>..."
@@ -729,8 +741,10 @@ cmd_domains() {
       else
         for d in "${given[@]}"; do
           grep -qxF -- "$d" <<<"$cur" || warn "$d is not in the instance allowlist"
-          if read_domains "$CONFIG_DIR/base-domains.txt" | grep -qxF -- "$d"; then
-            warn "$d is in base-domains.txt; edit $CONFIG_DIR/base-domains.txt to remove it for all instances"
+          if domains_from "$name" base | grep -qxF -- "$d"; then
+            warn "$d is allowed for all instances (domains.txt); override $CONFIG_DIR/domains.txt to remove it"
+          elif domains_from "$name" tool | grep -qxF -- "$d"; then
+            warn "$d is allowed for all $(instance_tool "$name") instances; override $CONFIG_DIR/tools/$(instance_tool "$name")/domains.txt to remove it"
           fi
         done
         { printf '%s\n' "$cur" | grep -vxF -f <(printf '%s\n' "${given[@]}") || true; } | write_instance_domains "$name"
@@ -787,40 +801,62 @@ cmd_logs() {
 }
 
 cmd_build() {
-  local version=""
+  local tool="" version=""
   while (($#)); do
     case $1 in
       --version) (($# >= 2)) || die "--version needs a value"; version=$2; shift 2 ;;
       --version=*) version=${1#*=}; shift ;;
-      *) die "usage: paddock build [--version X]" ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z $tool ]] || die "unexpected argument '$1'"; tool=$1; shift ;;
     esac
   done
+  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] (tools: $(list_tools | paste -sd' '))"
+  load_tool "$tool"
   if [[ -z $version ]]; then
+    [[ -n ${TOOL[npm_package]} ]] || die "tool '$tool' has no npm_package to resolve the latest version from; pass --version X"
     need_cmd curl
-    info "resolving latest Claude Code version from the npm registry"
-    version=$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest \
+    info "resolving latest ${TOOL[npm_package]} version from the npm registry"
+    version=$(curl -fsSL "https://registry.npmjs.org/${TOOL[npm_package]}/latest" \
               | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4) \
       || die "could not resolve the latest version; pass --version X"
   fi
   [[ $version =~ $VERSION_RE ]] || die "invalid version '$version' (expected e.g. 2.1.0)"
 
-  local ctx; ctx=$(mktemp -d)
+  local ctx f src
+  ctx=$(mktemp -d)
   # shellcheck disable=SC2064
   trap "rm -rf '$ctx'" EXIT
   # Optional extra build-context files (e.g. a corporate CA) live in build/.
   if [[ -d $CONFIG_DIR/build ]]; then cp -a "$CONFIG_DIR/build/." "$ctx/"; fi
-  cp "$CONFIG_DIR/Containerfile.proxy" "$CONFIG_DIR/Containerfile.agent" "$ctx/"
+  for f in Containerfile.proxy Containerfile.base "tools/$tool/Containerfile"; do
+    src=$(data_file "$f") || die "$f not found in $CONFIG_DIR or $DATA_DIR"
+    cp "$src" "$ctx/${f//\//_}"
+  done
+
+  local img="$AGENT_IMAGE_PREFIX$tool:$version"
   info "building $PROXY_IMAGE"
   podman build --pull=newer -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
-  info "building $AGENT_IMAGE_REPO:$version"
-  podman build --pull=newer -t "$AGENT_IMAGE_REPO:$version" \
-    --build-arg "CLAUDE_CODE_VERSION=$version" -f "$ctx/Containerfile.agent" "$ctx"
-  local old=${CFG[agent_version]}
-  set_config agent_version "$version"
-  info "agent image is now $AGENT_IMAGE_REPO:$version"
-  if [[ -n $old && $old != "$version" ]] && compgen -G "$INSTANCES_DIR/*/" >/dev/null; then
-    info "existing instances still use $AGENT_IMAGE_REPO:$old; run 'paddock recreate <name>' to switch (login is kept)"
+  info "building $BASE_IMAGE"
+  podman build --pull=newer -t "$BASE_IMAGE" -f "$ctx/Containerfile.base" "$ctx"
+  info "building $img"
+  podman build --pull=never -t "$img" --build-arg "PADDOCK_BASE=$BASE_IMAGE" \
+    --build-arg "TOOL_VERSION=$version" -f "$ctx/tools_${tool}_Containerfile" "$ctx"
+  local old; old=$(tool_version "$tool")
+  set_tool_version "$tool" "$version"
+  info "$tool image is now $img"
+  if [[ -n $old && $old != "$version" ]] && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
+    info "existing $tool instances still use $AGENT_IMAGE_PREFIX$tool:$old; run 'paddock recreate <name>' to switch (login is kept)"
   fi
+}
+
+cmd_tools() {
+  (($# == 0)) || die "usage: paddock tools"
+  local t v src
+  printf '%-12s %-12s %s\n' TOOL IMAGE DEFINITION
+  while IFS= read -r t; do
+    v=$(tool_version "$t"); src=$(data_file "tools/$t/tool.conf")
+    printf '%-12s %-12s %s\n' "$t" "${v:-(not built)}" "$(dirname "$src")"
+  done < <(list_tools)
 }
 
 usage() {
@@ -829,19 +865,22 @@ paddock $PADDOCK_VERSION - isolated coding-agent instances on rootless Podman
 
 Usage: paddock <command> [args]
 
-  create <name> <path> [--domains d1,d2,...]   create an instance (not started)
-  start <name>                                 start proxy, then agent
-  attach <name> [--yolo] [-- claude args]      run claude in /workspace
-  shell <name>                                 bash in the agent container
-  stop <name>                                  stop agent and proxy
-  rm <name> [--force]                          remove instance (workspace kept)
-  recreate <name>                              recreate containers (e.g. after build)
-  list                                         list instances
-  domains <name> list|add|rm|edit [domain...]  manage the instance allowlist
-  logs <name> [-f] [-n N] [--raw]              proxy log of allowed/denied requests
-  build [--version X]                          build agent and proxy images
+  create <tool> <name> <path> [--domains d1,d2,...]   create an instance (not started)
+  start <name>                                        start proxy, then agent
+  attach <name> [--yolo] [-- tool args]               run the tool in /workspace
+  shell <name>                                        bash in the agent container
+  stop <name>                                         stop agent and proxy
+  rm <name> [--force]                                 remove instance (workspace kept)
+  recreate <name>                                     recreate containers (e.g. after build)
+  list                                                list instances
+  domains <name> list|add|rm|edit [domain...]         manage the instance allowlist
+  logs <name> [-f] [-n N] [--raw]                     proxy log of allowed/denied requests
+  build <tool> [--version X]                          build proxy, base and tool images
+  tools                                               list available tools
 
-Config: $CONFIG_DIR
+Tools:   $( [[ -n $DATA_DIR ]] && list_tools | paste -sd' ')
+Config:  $CONFIG_DIR (a file here overrides the data dir file at the same path)
+Data:    ${DATA_DIR:-(not found)}
 Domains: example.com (exact) or .example.com (domain + subdomains).
 EOF
 }
@@ -849,7 +888,7 @@ EOF
 main() {
   local cmd=${1-help}; (($#)) && shift
   case $cmd in
-    help|-h|--help) usage; return 0 ;;
+    help|-h|--help) DATA_DIR=$(find_data_dir 2>/dev/null) || DATA_DIR=""; usage; return 0 ;;
     version|--version) echo "paddock $PADDOCK_VERSION"; return 0 ;;
   esac
   ((EUID != 0)) || die "run paddock as a normal user, not root"
@@ -867,6 +906,7 @@ main() {
     domains)  cmd_domains "$@" ;;
     logs)     cmd_logs "$@" ;;
     build)    cmd_build "$@" ;;
+    tools)    cmd_tools "$@" ;;
     *) usage >&2; die "unknown command '$cmd'" ;;
   esac
 }
