@@ -112,32 +112,23 @@ These work without help from the user once their registry is allowlisted
 ### System packages and tools (pacman)
 
 The image is Arch Linux, but you cannot run `pacman` (no root). Ask the user
-to add the package to the image. Tell them the package names and give them
-these steps:
+to add the packages to this instance, and tell them why you need them:
 
-1. Copy the tool's Containerfile into their config directory, if they have
-   not done so already (replace `<tool>` with `$PADDOCK_TOOL`):
+```
+paddock packages <instance> add <package>...
+paddock recreate <instance>
+```
 
-   ```
-   mkdir -p ~/.config/paddock/tools/<tool>
-   cp ~/.local/share/paddock/tools/<tool>/Containerfile ~/.config/paddock/tools/<tool>/
-   ```
-
-   (`paddock tools` shows where the shipped definition lives if paddock is
-   installed elsewhere.)
-2. Add a line before the final `LABEL` line, e.g.
-
-   ```
-   RUN pacman -Syu --noconfirm --needed <package>... && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
-   ```
-
-3. Rebuild the image and recreate the instance (the login and `$HOME` are kept,
-   but this agent session ends):
-
-   ```
-   paddock build <tool>
-   paddock recreate <instance>
-   ```
+- Use package names from the official Arch repositories (e.g. `godot`,
+  `base-devel`); AUR packages are not available this way.
+- `add` builds an image for this instance only, on the host; the package
+  mirrors do not need to be allowlisted. If a package does not exist, the
+  build fails and nothing changes.
+- `recreate` ends this agent session. `/workspace` and `$HOME` (including the
+  login) are kept, so note what you were doing before you ask.
+- There is no display: GUI programs only work in a headless mode, if they
+  have one (e.g. `godot --headless`).
+- `paddock packages <instance> list` shows what is installed this way.
 
 Anything you install outside `/workspace` and `$HOME` is lost on
 `paddock recreate`.

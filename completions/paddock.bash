@@ -24,6 +24,11 @@ _paddock_instance_domains() { # name
   [[ -f $f ]] && sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' "$f"
 }
 
+_paddock_instance_packages() { # name
+  local f="${XDG_CONFIG_HOME:-$HOME/.config}/paddock/instances/$1/packages.txt"
+  [[ -f $f ]] && sed -e 's/#.*//' "$f" | tr -s '[:space:]' '\n' | sed '/^$/d'
+}
+
 _paddock() {
   local cur prev words cword
   if declare -F _init_completion >/dev/null; then
@@ -33,7 +38,7 @@ _paddock() {
     words=("${COMP_WORDS[@]}") cword=$COMP_CWORD
   fi
 
-  local cmds="create start attach shell stop rm recreate list ls domains logs build tools doctor purge help version"
+  local cmds="create start attach shell stop rm recreate list ls domains packages logs build tools doctor purge help version"
   if ((cword == 1)); then
     mapfile -t COMPREPLY < <(compgen -W "$cmds" -- "$cur")
     return
@@ -48,7 +53,7 @@ _paddock() {
     w=${words[i]}
     case $w in
       --) break ;;
-      -n|--tail|--domains|--version) ((i++)); continue ;;
+      -n|--tail|--domains|--packages|--version) ((i++)); continue ;;
       -*) continue ;;
     esac
     args+=("$w")
@@ -58,13 +63,13 @@ _paddock() {
   for ((i = 2; i < cword; i++)); do [[ ${words[i]} == -- ]] && return; done
 
   case $prev in
-    -n|--tail|--domains|--version) return ;;
+    -n|--tail|--domains|--packages|--version) return ;;
   esac
 
   local opts="" list=""
   case $cmd in
     create)
-      opts="--domains --no-agents-md"
+      opts="--domains --packages --no-agents-md"
       case $n in
         1) list=$(_paddock_tools) ;;
         3) [[ $cur != -* ]] && { compopt -o filenames 2>/dev/null
@@ -87,6 +92,13 @@ _paddock() {
         2) list="list add rm edit" ;;
         *) # Offer only domains not already given.
            [[ ${args[1]} == rm ]] && list=$(_paddock_instance_domains "${args[0]}" \
+             | grep -vxF -f <(printf '%s\n' "${args[@]:2}") ) ;;
+      esac ;;
+    packages)
+      case $n in
+        1) list=$(_paddock_instances) ;;
+        2) list="list add rm edit" ;;
+        *) [[ ${args[1]} == rm ]] && list=$(_paddock_instance_packages "${args[0]}" \
              | grep -vxF -f <(printf '%s\n' "${args[@]:2}") ) ;;
       esac ;;
     build)
