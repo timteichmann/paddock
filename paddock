@@ -124,7 +124,8 @@ tool_version() {
 
 set_tool_version() { # tool version
   local f="$CONFIG_DIR/images"
-  { [[ -f $f ]] && grep -v "^$1=" "$f"; printf '%s=%s\n' "$1" "$2"; } | atomic_write "$f" 0644
+  # grep -v exits 1 when no other lines remain; that must not abort under set -e.
+  { if [[ -f $f ]]; then grep -v "^$1=" "$f" || true; fi; printf '%s=%s\n' "$1" "$2"; } | atomic_write "$f" 0644
 }
 
 # Tools with a tool.conf in the data dir or the config dir.
