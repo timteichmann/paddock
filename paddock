@@ -1,0 +1,855 @@
+#!/usr/bin/env bash
+# paddock - isolated coding-agent instances on rootless Podman.
+#
+# Each instance = one agent container (internal network only, no route out)
+# + one Squid proxy container (internal + external network) that enforces a
+# per-instance domain allowlist. The agent can see exactly one host directory.
+#
+# See README.md for the design; `paddock help` for usage.
+
+set -euo pipefail
+shopt -s nullglob
+
+readonly PADDOCK_VERSION="0.1.0"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/paddock"
+readonly INSTANCES_DIR="$CONFIG_DIR/instances"
+readonly LABEL_KEY="paddock.instance"
+readonly PROXY_PORT=3128
+readonly PROXY_IMAGE="localhost/paddock-proxy:latest"
+readonly AGENT_IMAGE_REPO="localhost/paddock-agent"
+readonly NAME_RE='^[a-z0-9][a-z0-9-]{0,30}$'
+# exact:  label(.label)+      wildcard: .label(.label)+
+# Last label must start with a letter, so IPv4 literals are rejected.
+readonly DOMAIN_RE='^\.?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$'
+readonly VERSION_RE='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+
+# ---------------------------------------------------------------- helpers --
+
+die()  { printf 'paddock: error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'paddock: warning: %s\n' "$*" >&2; }
+info() { printf 'paddock: %s\n' "$*" >&2; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"; }
+
+# Write stdin to $1 atomically (same directory, then rename).
+atomic_write() {
+  local dest=$1 tmp
+  tmp=$(mktemp "$(dirname "$dest")/.$(basename "$dest").XXXXXX")
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod "${2:-0644}" "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+have_tty() { (exec </dev/tty) 2>/dev/null; }
+
+confirm() {
+  local reply
+  have_tty || die "cannot ask for confirmation (no terminal); use --force"
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r reply </dev/tty || return 1
+  [[ $reply == [yY] || $reply == [yY][eE][sS] ]]
+}
+
+# ----------------------------------------------------------------- config --
+
+# Defaults; overridable in $CONFIG_DIR/config (KEY=VALUE, not sourced).
+declare -A CFG=(
+  [agent_version]=""
+  [agent_memory]="4g"
+  [agent_cpus]="2"
+  [agent_pids_limit]="2048"
+  [proxy_memory]="256m"
+  [proxy_cpus]="0.5"
+  [proxy_pids_limit]="256"
+  [relabel]=""          # "", "z" or "Z" (SELinux relabel of bind mounts)
+)
+
+load_config() {
+  local f="$CONFIG_DIR/config" line key val n=0
+  [[ -f $f ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -z $line ]] && continue
+    [[ $line == *=* ]] || die "$f:$n: expected KEY=VALUE"
+    key="${line%%=*}"; val="${line#*=}"
+    [[ -v CFG[$key] ]] || die "$f:$n: unknown setting '$key'"
+    CFG[$key]=$val
+  done <"$f"
+  [[ ${CFG[relabel]} =~ ^[zZ]?$ ]] || die "$f: relabel must be empty, 'z' or 'Z'"
+  local k
+  for k in agent_pids_limit proxy_pids_limit; do
+    [[ ${CFG[$k]} =~ ^[0-9]*$ ]] || die "$f: $k must be a number or empty"
+  done
+}
+
+set_config() { # key value
+  local f="$CONFIG_DIR/config" key=$1 val=$2
+  { [[ -f $f ]] && grep -v "^[[:space:]]*$key=" "$f"; printf '%s=%s\n' "$key" "$val"; } \
+    | atomic_write "$f" 0644
+  CFG[$key]=$val
+}
+
+init_config_dir() {
+  umask 077
+  mkdir -p "$INSTANCES_DIR"
+  chmod 700 "$CONFIG_DIR"
+  [[ -f $CONFIG_DIR/base-domains.txt ]] || write_default_base_domains
+  [[ -f $CONFIG_DIR/Containerfile.agent ]] || write_default_containerfile_agent
+  [[ -f $CONFIG_DIR/Containerfile.proxy ]] || write_default_containerfile_proxy
+  [[ -f $CONFIG_DIR/config ]] || write_default_config
+  umask 022
+  load_config
+}
+
+write_default_config() {
+  cat >"$CONFIG_DIR/config" <<'EOF'
+# paddock settings (KEY=VALUE). Empty value disables a limit.
+# agent_version is set by `paddock build`.
+agent_memory=4g
+agent_cpus=2
+agent_pids_limit=2048
+proxy_memory=256m
+proxy_cpus=0.5
+proxy_pids_limit=256
+# SELinux relabel flag for bind mounts: empty (Arch default), z or Z.
+relabel=
+EOF
+}
+
+write_default_base_domains() {
+  cat >"$CONFIG_DIR/base-domains.txt" <<'EOF'
+# Domains every paddock instance may reach.
+# Syntax: example.com (exact) or .example.com (domain and all subdomains).
+api.anthropic.com
+claude.ai
+platform.claude.com
+EOF
+}
+
+write_default_containerfile_agent() {
+  cat >"$CONFIG_DIR/Containerfile.agent" <<'EOF'
+# paddock agent image. Built by `paddock build [--version X]`.
+ARG BASE_IMAGE=docker.io/library/archlinux:latest
+FROM ${BASE_IMAGE}
+
+ARG CLAUDE_CODE_VERSION
+RUN test -n "$CLAUDE_CODE_VERSION" || { echo "CLAUDE_CODE_VERSION build arg is required" >&2; exit 1; }
+
+RUN pacman -Syu --noconfirm --needed \
+      bash ca-certificates curl git less nodejs npm procps-ng python ripgrep \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+
+RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+ && npm cache clean --force \
+ && claude --version
+
+# No sudo (not in the base image); strip setuid/setgid bits; git over HTTPS only.
+RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
+ && mkdir -p /home/agent /workspace && chmod 0777 /home/agent \
+ && git config --system url."https://github.com/".insteadOf "git@github.com:" \
+ && git config --system --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
+ && git config --system url."https://gitlab.com/".insteadOf "git@gitlab.com:"
+
+ENV HOME=/home/agent \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+WORKDIR /workspace
+LABEL paddock.image=agent
+CMD ["sleep", "infinity"]
+EOF
+}
+
+write_default_containerfile_proxy() {
+  cat >"$CONFIG_DIR/Containerfile.proxy" <<'EOF'
+# paddock proxy image: Squid only. Config is mounted per instance at runtime.
+ARG BASE_IMAGE=docker.io/library/archlinux:latest
+FROM ${BASE_IMAGE}
+RUN pacman -Syu --noconfirm --needed squid \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+LABEL paddock.image=proxy
+CMD ["squid", "-N", "-f", "/etc/paddock/squid.conf"]
+EOF
+}
+
+# --------------------------------------------------------------- validate --
+
+validate_name() {
+  [[ ${1-} =~ $NAME_RE ]] || die "invalid instance name '${1-}' (must match $NAME_RE)"
+}
+
+instance_dir() { printf '%s/%s' "$INSTANCES_DIR" "$1"; }
+
+require_instance() {
+  validate_name "$1"
+  [[ -d $(instance_dir "$1") ]] || die "no such instance '$1' (see 'paddock list')"
+}
+
+# Normalize a domain (lowercase) or die.
+normalize_domain() {
+  local d=${1,,}
+  if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
+    die "invalid domain '$1' (use example.com or .example.com; no IPs, URLs, ports or wildcards)"
+  fi
+  printf '%s' "$d"
+}
+
+# Print validated domains from a file (comments/blank lines ignored).
+read_domains() {
+  local f=$1 line n=0 d
+  [[ -f $f ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    [[ -z $line ]] && continue
+    d=${line,,}
+    if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
+      printf 'paddock: error: %s:%d: invalid domain %q\n' "$f" "$n" "$line" >&2
+      return 1
+    fi
+    printf '%s\n' "$d"
+  done <"$f"
+}
+
+# Remove duplicates and entries covered by a wildcard (Squid treats overlaps
+# as fatal). stdin -> stdout, sorted.
+dedupe_domains() {
+  sort -u | awk '
+    { d[NR] = $0; if (substr($0, 1, 1) == ".") wild[$0] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        x = d[i]; covered = 0
+        # x itself (exact "a.b") is covered by ".a.b"
+        if (substr(x, 1, 1) != "." && (("." x) in wild)) covered = 1
+        # any proper parent suffix ".b.c" covers x
+        s = (substr(x, 1, 1) == ".") ? substr(x, 2) : x
+        while (!covered && (p = index(s, ".")) > 0) {
+          s = substr(s, p + 1)
+          if (("." s) in wild) covered = 1
+        }
+        if (!covered) print x
+      }
+    }' | sort
+}
+
+# Resolve and vet a workspace path; prints absolute path.
+check_workspace_path() {
+  local p=$1 home cfg
+  home=$(realpath -m -- "$HOME")
+  cfg=$(realpath -m -- "$CONFIG_DIR")
+  p=$(realpath -m -- "$p")
+  if [[ $p == / ]]; then die "refusing to use / as a workspace"; fi
+  if [[ $p == "$home" ]]; then die "refusing to use \$HOME ($home) as a workspace"; fi
+  if [[ $home == "$p"/* ]]; then die "refusing to use $p: it is a parent of \$HOME"; fi
+  if [[ $p == "$cfg" || $p == "$cfg"/* || $cfg == "$p"/* ]]; then
+    die "refusing to use $p: it overlaps the paddock config dir ($cfg)"
+  fi
+  printf '%s' "$p"
+}
+
+# ------------------------------------------------------------------ podman --
+
+agent_ctr() { printf 'pd-%s-agent' "$1"; }
+proxy_ctr() { printf 'pd-%s-proxy' "$1"; }
+int_net()   { printf 'pd-%s-int' "$1"; }
+ext_net()   { printf 'pd-%s-ext' "$1"; }
+home_vol()  { printf 'pd-%s-home' "$1"; }
+
+ctr_exists() { podman container exists "$1"; }
+ctr_state()  { podman container inspect --format '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
+ctr_running() { [[ $(ctr_state "$1") == running ]]; }
+
+agent_image() {
+  [[ -n ${CFG[agent_version]} ]] || die "no agent image built yet; run 'paddock build' first"
+  printf '%s:%s' "$AGENT_IMAGE_REPO" "${CFG[agent_version]}"
+}
+
+require_images() {
+  local img
+  img=$(agent_image)
+  podman image exists "$img" || die "agent image $img not found; run 'paddock build --version ${CFG[agent_version]}'"
+  podman image exists "$PROXY_IMAGE" || die "proxy image $PROXY_IMAGE not found; run 'paddock build'"
+}
+
+ip2int() {
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $1
+  printf '%d' $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+}
+int2ip() { local n=$1; printf '%d.%d.%d.%d' $(( (n >> 24) & 255 )) $(( (n >> 16) & 255 )) $(( (n >> 8) & 255 )) $(( n & 255 )); }
+
+# The internal network's IPv4 subnet (CIDR).
+int_subnet() {
+  local s
+  s=$(podman network inspect --format '{{range .Subnets}}{{.Subnet}} {{end}}' "$(int_net "$1")" 2>/dev/null) \
+    || die "network $(int_net "$1") is missing; run 'paddock recreate $1'"
+  for s in $s; do
+    [[ $s == *.*.*.*/* ]] && { printf '%s' "$s"; return 0; }
+  done
+  die "network $(int_net "$1") has no IPv4 subnet"
+}
+
+# Static proxy address on the internal network: last usable host address.
+proxy_ip() {
+  local cidr base prefix mask net bcast
+  cidr=$(int_subnet "$1")
+  base=${cidr%/*}; prefix=${cidr#*/}
+  (( prefix <= 29 )) || die "internal subnet $cidr is too small"
+  mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+  net=$(( $(ip2int "$base") & mask ))
+  bcast=$(( net | (~mask & 0xFFFFFFFF) ))
+  int2ip $(( bcast - 1 ))
+}
+
+limit_args() { # prefix -> podman resource flags
+  local p=$1
+  [[ -n ${CFG[${p}_memory]} ]]     && printf -- '--memory=%s\n' "${CFG[${p}_memory]}"
+  [[ -n ${CFG[${p}_cpus]} ]]       && printf -- '--cpus=%s\n' "${CFG[${p}_cpus]}"
+  [[ -n ${CFG[${p}_pids_limit]} ]] && printf -- '--pids-limit=%s\n' "${CFG[${p}_pids_limit]}"
+  return 0
+}
+
+mount_opt() { # extra options -> ",z" etc.
+  local opts=$1
+  [[ -n ${CFG[relabel]} ]] && opts+=",${CFG[relabel]}"
+  printf '%s' "$opts"
+}
+
+# Remove every podman object labelled for the instance (and by name, in case
+# a label is missing). Never touches the workspace.
+remove_podman_objects() {
+  local name=$1 ids
+  ids=$(podman ps -a -q --filter "label=$LABEL_KEY=$name" 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  [[ -n $ids ]] && podman rm -f -t 5 $ids >/dev/null
+  local c; for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
+    ctr_exists "$c" && podman rm -f -t 5 "$c" >/dev/null
+  done
+  ids=$(podman volume ls -q --filter "label=$LABEL_KEY=$name" 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  [[ -n $ids ]] && podman volume rm -f $ids >/dev/null
+  ids=$(podman network ls -q --filter "label=$LABEL_KEY=$name" 2>/dev/null || true)
+  # shellcheck disable=SC2086
+  [[ -n $ids ]] && podman network rm -f $ids >/dev/null
+  return 0
+}
+
+# ------------------------------------------------------------ proxy config --
+
+generate_proxy_config() {
+  local name=$1 dir pdir ip subnet
+  dir=$(instance_dir "$name"); pdir="$dir/proxy"
+  mkdir -p "$pdir"; chmod 755 "$pdir"
+  ip=$(proxy_ip "$name"); subnet=$(int_subnet "$name")
+
+  local base inst
+  base=$(read_domains "$CONFIG_DIR/base-domains.txt") || exit 1
+  inst=$(read_domains "$dir/domains.txt") || exit 1
+  {
+    printf '# generated by paddock: base-domains.txt + instances/%s/domains.txt\n' "$name"
+    printf '%s\n%s\n' "$base" "$inst" | sed '/^$/d' | dedupe_domains
+    # never empty: Squid rejects an empty dstdomain file
+    printf 'paddock.invalid\n'
+  } | atomic_write "$pdir/allowlist.txt" 0644
+
+  if [[ -f $CONFIG_DIR/squid-extra.conf ]]; then
+    atomic_write "$pdir/extra.conf" 0644 <"$CONFIG_DIR/squid-extra.conf"
+  else
+    rm -f "$pdir/extra.conf"
+  fi
+
+  atomic_write "$pdir/squid.conf" 0644 <<EOF
+# generated by paddock for instance '$name' - do not edit, regenerated on start
+# and on every 'paddock domains' change.
+
+# Listen on the internal network only.
+http_port $ip:$PROXY_PORT
+icp_port 0
+htcp_port 0
+
+pid_filename /tmp/squid.pid
+coredump_dir /tmp
+netdb_filename none
+pinger_enable off
+cache deny all
+cache_mem 8 MB
+via off
+forwarded_for delete
+httpd_suppress_version_string on
+shutdown_lifetime 1 seconds
+logfile_rotate 0
+
+logformat paddock paddock-access %{%Y-%m-%dT%H:%M:%S%z}tl %>a %rm %>rd %>rP %Ss %>Hs
+access_log stdio:/dev/stdout paddock
+cache_log /dev/stderr
+
+acl agent_net src $subnet
+acl allowlist dstdomain -n "/etc/paddock/allowlist.txt"
+acl CONNECT method CONNECT
+acl port_https port 443
+acl port_http port 80
+acl proto_http proto HTTP
+# Loopback, "this network", RFC 1918, CGNAT, link-local, IETF/test/benchmark
+# ranges, multicast/reserved; IPv6 loopback/unspecified, v4-mapped, NAT64,
+# ULA, link-local, documentation, multicast.
+acl forbidden_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4
+acl forbidden_dst dst ::/128 ::1/128 ::ffff:0:0/96 64:ff9b::/96 64:ff9b:1::/48 fc00::/7 fe80::/10 fec0::/10 2001:db8::/32 ff00::/8
+
+http_access deny !agent_net
+http_access deny !allowlist
+http_access deny CONNECT !port_https
+http_access deny !CONNECT !port_http
+http_access deny !CONNECT !proto_http
+http_access deny forbidden_dst
+http_access allow agent_net
+http_access deny all
+$( [[ -f $pdir/extra.conf ]] && printf '\n# user additions from squid-extra.conf\ninclude /etc/paddock/extra.conf\n' )
+EOF
+}
+
+reload_proxy() {
+  local name=$1 pc
+  pc=$(proxy_ctr "$name")
+  generate_proxy_config "$name"
+  if ctr_running "$pc"; then
+    podman exec "$pc" squid -k parse -f /etc/paddock/squid.conf >/dev/null 2>&1 \
+      || die "proxy rejected the new configuration; see 'podman exec $pc squid -k parse -f /etc/paddock/squid.conf'"
+    local out
+    out=$(podman exec "$pc" squid -k reconfigure -f /etc/paddock/squid.conf 2>&1) \
+      || { printf '%s\n' "$out" >&2; die "failed to reload proxy $pc"; }
+    info "proxy reloaded"
+  fi
+}
+
+wait_proxy_ready() {
+  local pc=$1 ip=$2
+  for _ in $(seq 1 50); do
+    ctr_running "$pc" || break
+    if podman logs "$pc" 2>&1 | grep -q "Accepting HTTP Socket connections at.*$ip:$PROXY_PORT"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  podman logs --tail 20 "$pc" >&2 || true
+  die "proxy $pc did not become ready"
+}
+
+# ------------------------------------------------------------- containers --
+
+create_containers() {
+  local name=$1 ws ip uid gid
+  ws=$(<"$(instance_dir "$name")/workspace")
+  [[ -d $ws ]] || die "workspace $ws does not exist"
+  ip=$(proxy_ip "$name")
+  uid=$(id -u); gid=$(id -g)
+  generate_proxy_config "$name"
+
+  local -a common=(
+    --label "$LABEL_KEY=$name"
+    --userns=keep-id --user "$uid:$gid"
+    --cap-drop=ALL
+    --security-opt=no-new-privileges
+  )
+  local -a plimits alimits
+  mapfile -t plimits < <(limit_args proxy)
+  mapfile -t alimits < <(limit_args agent)
+
+  podman create --name "$(proxy_ctr "$name")" "${common[@]}" "${plimits[@]}" \
+    --hostname "$(proxy_ctr "$name")" \
+    --network "$(int_net "$name"):ip=$ip" \
+    --network "$(ext_net "$name")" \
+    --read-only --tmpfs /tmp:rw,mode=1777,size=64m \
+    -v "$(instance_dir "$name")/proxy:/etc/paddock:$(mount_opt ro)" \
+    "$PROXY_IMAGE" >/dev/null
+
+  local purl
+  purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
+  podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
+    --hostname "$name" \
+    --network "$(int_net "$name")" \
+    --dns=none \
+    --add-host "$(proxy_ctr "$name"):$ip" \
+    --init \
+    -v "$(home_vol "$name"):/home/agent:U" \
+    -v "$ws:/workspace$( [[ -n ${CFG[relabel]} ]] && printf ':%s' "${CFG[relabel]}")" \
+    -w /workspace \
+    -e HOME=/home/agent \
+    -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
+    -e HTTP_PROXY="$purl"  -e http_proxy="$purl" \
+    -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
+    -e DISABLE_AUTOUPDATER=1 \
+    -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+    -e PADDOCK_INSTANCE="$name" \
+    "$(agent_image)" sleep infinity >/dev/null
+}
+
+create_networks_and_volume() {
+  local name=$1
+  podman network create --internal --disable-dns -o isolate=true \
+    --label "$LABEL_KEY=$name" "$(int_net "$name")" >/dev/null
+  podman network create -o isolate=true \
+    --label "$LABEL_KEY=$name" "$(ext_net "$name")" >/dev/null
+  podman volume exists "$(home_vol "$name")" \
+    || podman volume create --label "$LABEL_KEY=$name" "$(home_vol "$name")" >/dev/null
+}
+
+start_instance() {
+  local name=$1 pc ac
+  pc=$(proxy_ctr "$name"); ac=$(agent_ctr "$name")
+  { ctr_exists "$pc" && ctr_exists "$ac"; } || die "containers for '$name' are missing; run 'paddock recreate $name'"
+  local ws; ws=$(<"$(instance_dir "$name")/workspace")
+  [[ -d $ws ]] || die "workspace $ws does not exist"
+  if ! ctr_running "$pc"; then
+    generate_proxy_config "$name"
+    podman start "$pc" >/dev/null
+    wait_proxy_ready "$pc" "$(proxy_ip "$name")"
+  fi
+  ctr_running "$ac" || podman start "$ac" >/dev/null
+}
+
+# env-file arg for exec sessions (optional per-instance env file)
+exec_env_args() {
+  local f; f="$(instance_dir "$1")/env"
+  if [[ -f $f ]]; then printf -- '--env-file=%s\n' "$f"; fi
+}
+
+tty_flags() { if [[ -t 0 && -t 1 ]]; then printf -- '-it'; else printf -- '-i'; fi; }
+
+# --------------------------------------------------------------- commands --
+
+cmd_create() {
+  local name="" path="" domains_csv=""
+  while (($#)); do
+    case $1 in
+      --domains) (($# >= 2)) || die "--domains needs a value"; domains_csv=$2; shift 2 ;;
+      --domains=*) domains_csv=${1#*=}; shift ;;
+      -*) die "unknown option '$1'" ;;
+      *) if [[ -z $name ]]; then name=$1; elif [[ -z $path ]]; then path=$1; else die "unexpected argument '$1'"; fi; shift ;;
+    esac
+  done
+  [[ -n $name && -n $path ]] || die "usage: paddock create <name> <path> [--domains d1,d2,...]"
+  validate_name "$name"
+  local dir; dir=$(instance_dir "$name")
+  [[ -e $dir ]] && die "instance '$name' already exists"
+  if podman ps -a -q --filter "label=$LABEL_KEY=$name" | grep -q . \
+     || podman network exists "$(int_net "$name")" || podman network exists "$(ext_net "$name")"; then
+    die "podman objects for '$name' already exist; remove them or use 'paddock rm $name --force'"
+  fi
+
+  local -a domains=()
+  local d
+  if [[ -n $domains_csv ]]; then
+    IFS=, read -r -a parts <<<"$domains_csv"
+    for d in "${parts[@]}"; do
+      d=${d//[[:space:]]/}; [[ -z $d ]] && continue
+      domains+=("$(normalize_domain "$d")")
+    done
+  fi
+
+  require_images
+
+  local ws
+  ws=$(check_workspace_path "$path")
+  [[ -e $ws && ! -d $ws ]] && die "$ws exists and is not a directory"
+  mkdir -p -- "$ws"
+  ws=$(check_workspace_path "$(realpath -e -- "$ws")")   # re-check after symlink resolution
+
+  # Roll back everything on failure.
+  trap 'rc=$?; if ((rc)); then warn "create failed, rolling back"; remove_podman_objects "'"$name"'"; rm -rf -- "'"$dir"'"; fi' EXIT
+  mkdir -p "$dir"
+  printf '%s\n' "$ws" | atomic_write "$dir/workspace" 0644
+  { printf '# extra domains for instance %s (example.com or .example.com)\n' "$name"
+    if ((${#domains[@]})); then printf '%s\n' "${domains[@]}" | sort -u; fi
+  } | atomic_write "$dir/domains.txt" 0644
+
+  create_networks_and_volume "$name"
+  create_containers "$name"
+  trap - EXIT
+  info "created instance '$name' (workspace $ws). Start it with: paddock start $name"
+}
+
+cmd_recreate() {
+  (($# == 1)) || die "usage: paddock recreate <name>"
+  local name=$1; require_instance "$name"; require_images
+  local c
+  for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
+    ctr_exists "$c" && podman rm -f -t 5 "$c" >/dev/null
+  done
+  if ! { podman network exists "$(int_net "$name")" && podman network exists "$(ext_net "$name")"; }; then
+    local n
+    for n in "$(int_net "$name")" "$(ext_net "$name")"; do
+      if podman network exists "$n"; then podman network rm -f "$n" >/dev/null; fi
+    done
+    create_networks_and_volume "$name"
+  fi
+  podman volume exists "$(home_vol "$name")" \
+    || podman volume create --label "$LABEL_KEY=$name" "$(home_vol "$name")" >/dev/null
+  create_containers "$name"
+  info "recreated containers for '$name' with $(agent_image) (home volume kept)"
+}
+
+cmd_start() {
+  (($# == 1)) || die "usage: paddock start <name>"
+  require_instance "$1"
+  start_instance "$1"
+  info "instance '$1' is running"
+}
+
+cmd_stop() {
+  (($# == 1)) || die "usage: paddock stop <name>"
+  local name=$1 c; require_instance "$name"
+  for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
+    ctr_exists "$c" && podman stop -t 5 "$c" >/dev/null
+  done
+  info "instance '$name' stopped"
+}
+
+cmd_attach() {
+  local name="" yolo=0
+  local -a cargs=()
+  while (($#)); do
+    case $1 in
+      --yolo) yolo=1; shift ;;
+      --) shift; cargs=("$@"); break ;;
+      -*) die "unknown option '$1' (pass claude arguments after --)" ;;
+      *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1; shift ;;
+    esac
+  done
+  [[ -n $name ]] || die "usage: paddock attach <name> [--yolo] [-- claude args]"
+  require_instance "$name"
+  start_instance "$name"
+  if ((yolo)); then
+    printf '\033[1;31mWARNING:\033[0m --yolo runs Claude Code with --dangerously-skip-permissions.\n' >&2
+    printf 'It will run commands and edit files in %s without asking.\n' "$(<"$(instance_dir "$name")/workspace")" >&2
+    cargs=(--dangerously-skip-permissions "${cargs[@]}")
+  fi
+  local -a envs; mapfile -t envs < <(exec_env_args "$name")
+  exec podman exec "$(tty_flags)" -w /workspace "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
+}
+
+cmd_shell() {
+  (($# == 1)) || die "usage: paddock shell <name>"
+  require_instance "$1"
+  start_instance "$1"
+  local -a envs; mapfile -t envs < <(exec_env_args "$1")
+  exec podman exec "$(tty_flags)" -w /workspace "${envs[@]}" "$(agent_ctr "$1")" bash
+}
+
+cmd_rm() {
+  local name="" force=0
+  while (($#)); do
+    case $1 in
+      -f|--force) force=1 ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $name ]] || die "usage: paddock rm <name> [--force]"
+  validate_name "$name"
+  local dir ws="(unknown)"; dir=$(instance_dir "$name")
+  if [[ ! -d $dir ]] && ! podman ps -a -q --filter "label=$LABEL_KEY=$name" | grep -q . \
+     && ! podman network ls -q --filter "label=$LABEL_KEY=$name" | grep -q .; then
+    die "no such instance '$name'"
+  fi
+  [[ -f $dir/workspace ]] && ws=$(<"$dir/workspace")
+  if ((!force)); then
+    confirm "Remove instance '$name' (containers, networks, home volume incl. login, config)? Workspace $ws is kept." \
+      || die "aborted"
+  fi
+  remove_podman_objects "$name"
+  rm -rf -- "$dir"
+  info "removed instance '$name' (workspace $ws untouched)"
+}
+
+cmd_list() {
+  (($# == 0)) || die "usage: paddock list"
+  local dir name ws state a p n
+  printf '%-32s %-10s %-7s %s\n' NAME STATE DOMAINS WORKSPACE
+  for dir in "$INSTANCES_DIR"/*/; do
+    name=$(basename "$dir")
+    [[ $name =~ $NAME_RE ]] || continue
+    ws=$(cat "$dir/workspace" 2>/dev/null || echo '?')
+    a=$(ctr_state "$(agent_ctr "$name")"); p=$(ctr_state "$(proxy_ctr "$name")")
+    if [[ $a == "$p" ]]; then state=$a
+    elif [[ $a == running || $p == running ]]; then state=partial
+    else state=$a; fi
+    n=$(read_domains "$dir/domains.txt" 2>/dev/null | grep -c . || true)
+    printf '%-32s %-10s %-7s %s\n' "$name" "$state" "$n" "$ws"
+  done
+}
+
+write_instance_domains() { # name, domains on stdin
+  local f; f="$(instance_dir "$1")/domains.txt"
+  { printf '# extra domains for instance %s (example.com or .example.com)\n' "$1"; sort -u | grep . || true; } \
+    | atomic_write "$f" 0644
+}
+
+cmd_domains() {
+  (($# >= 2)) || die "usage: paddock domains <name> list|add|rm|edit [domain...]"
+  local name=$1 sub=$2; shift 2
+  require_instance "$name"
+  local f; f="$(instance_dir "$name")/domains.txt"
+  local cur d
+  case $sub in
+    list)
+      (($# == 0)) || die "usage: paddock domains <name> list"
+      read_domains "$CONFIG_DIR/base-domains.txt" | sort -u | sed 's/^/base      /'
+      read_domains "$f" | sort -u | sed 's/^/instance  /'
+      ;;
+    add|rm)
+      (($#)) || die "usage: paddock domains <name> $sub <domain>..."
+      local -a given=()
+      for d in "$@"; do given+=("$(normalize_domain "$d")"); done
+      cur=$(read_domains "$f") || exit 1
+      if [[ $sub == add ]]; then
+        { [[ -n $cur ]] && printf '%s\n' "$cur"; printf '%s\n' "${given[@]}"; } | write_instance_domains "$name"
+      else
+        for d in "${given[@]}"; do
+          grep -qxF -- "$d" <<<"$cur" || warn "$d is not in the instance allowlist"
+          if read_domains "$CONFIG_DIR/base-domains.txt" | grep -qxF -- "$d"; then
+            warn "$d is in base-domains.txt; edit $CONFIG_DIR/base-domains.txt to remove it for all instances"
+          fi
+        done
+        { printf '%s\n' "$cur" | grep -vxF -f <(printf '%s\n' "${given[@]}") || true; } | write_instance_domains "$name"
+      fi
+      reload_proxy "$name"
+      ;;
+    edit)
+      (($# == 0)) || die "usage: paddock domains <name> edit"
+      have_tty || die "domains edit needs a terminal; use 'domains $name add|rm' instead"
+      local tmp; tmp=$(mktemp --suffix=.txt)
+      # shellcheck disable=SC2064
+      trap "rm -f '$tmp'" EXIT
+      cp "$f" "$tmp"
+      while :; do
+        ${EDITOR:-${VISUAL:-vi}} "$tmp" </dev/tty >/dev/tty || die "editor failed"
+        if cur=$(read_domains "$tmp"); then break; fi
+        confirm "Invalid allowlist. Edit again?" || die "aborted; allowlist unchanged"
+      done
+      printf '%s\n' "$cur" | write_instance_domains "$name"
+      reload_proxy "$name"
+      ;;
+    *) die "unknown domains subcommand '$sub' (list|add|rm|edit)" ;;
+  esac
+}
+
+cmd_logs() {
+  local name="" follow=0 raw=0 tail=""
+  while (($#)); do
+    case $1 in
+      -f|--follow) follow=1; shift ;;
+      --raw) raw=1; shift ;;
+      -n|--tail) (($# >= 2)) || die "$1 needs a value"; tail=$2; shift 2 ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1; shift ;;
+    esac
+  done
+  [[ -n $name ]] || die "usage: paddock logs <name> [-f] [-n N] [--raw]"
+  require_instance "$name"
+  local pc; pc=$(proxy_ctr "$name")
+  ctr_exists "$pc" || die "proxy container $pc does not exist"
+  local -a args=()
+  ((follow)) && args+=(--follow)
+  if ((raw)); then
+    [[ -n $tail ]] && args+=(--tail "$tail")
+    exec podman logs "${args[@]}" "$pc"
+  fi
+  podman logs "${args[@]}" "$pc" 2>&1 | awk -v tail="$tail" '
+    $1 == "paddock-access" {
+      verdict = ($7 ~ /DENIED/) ? "DENIED " : "ALLOWED"
+      line = sprintf("%s %s %-7s %s:%s (%s %s)", $2, verdict, $4, $5, $6, $7, $8)
+      if (tail == "") { print line; fflush() } else { buf[n++ % tail] = line }
+    }
+    END { if (tail != "") for (i = (n > tail ? n - tail : 0); i < n; i++) print buf[i % tail] }'
+}
+
+cmd_build() {
+  local version=""
+  while (($#)); do
+    case $1 in
+      --version) (($# >= 2)) || die "--version needs a value"; version=$2; shift 2 ;;
+      --version=*) version=${1#*=}; shift ;;
+      *) die "usage: paddock build [--version X]" ;;
+    esac
+  done
+  if [[ -z $version ]]; then
+    need_cmd curl
+    info "resolving latest Claude Code version from the npm registry"
+    version=$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest \
+              | grep -o '"version":"[^"]*"' | head -n1 | cut -d'"' -f4) \
+      || die "could not resolve the latest version; pass --version X"
+  fi
+  [[ $version =~ $VERSION_RE ]] || die "invalid version '$version' (expected e.g. 2.1.0)"
+
+  local ctx; ctx=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$ctx'" EXIT
+  # Optional extra build-context files (e.g. a corporate CA) live in build/.
+  if [[ -d $CONFIG_DIR/build ]]; then cp -a "$CONFIG_DIR/build/." "$ctx/"; fi
+  cp "$CONFIG_DIR/Containerfile.proxy" "$CONFIG_DIR/Containerfile.agent" "$ctx/"
+  info "building $PROXY_IMAGE"
+  podman build --pull=newer -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
+  info "building $AGENT_IMAGE_REPO:$version"
+  podman build --pull=newer -t "$AGENT_IMAGE_REPO:$version" \
+    --build-arg "CLAUDE_CODE_VERSION=$version" -f "$ctx/Containerfile.agent" "$ctx"
+  local old=${CFG[agent_version]}
+  set_config agent_version "$version"
+  info "agent image is now $AGENT_IMAGE_REPO:$version"
+  if [[ -n $old && $old != "$version" ]] && compgen -G "$INSTANCES_DIR/*/" >/dev/null; then
+    info "existing instances still use $AGENT_IMAGE_REPO:$old; run 'paddock recreate <name>' to switch (login is kept)"
+  fi
+}
+
+usage() {
+  cat <<EOF
+paddock $PADDOCK_VERSION - isolated coding-agent instances on rootless Podman
+
+Usage: paddock <command> [args]
+
+  create <name> <path> [--domains d1,d2,...]   create an instance (not started)
+  start <name>                                 start proxy, then agent
+  attach <name> [--yolo] [-- claude args]      run claude in /workspace
+  shell <name>                                 bash in the agent container
+  stop <name>                                  stop agent and proxy
+  rm <name> [--force]                          remove instance (workspace kept)
+  recreate <name>                              recreate containers (e.g. after build)
+  list                                         list instances
+  domains <name> list|add|rm|edit [domain...]  manage the instance allowlist
+  logs <name> [-f] [-n N] [--raw]              proxy log of allowed/denied requests
+  build [--version X]                          build agent and proxy images
+
+Config: $CONFIG_DIR
+Domains: example.com (exact) or .example.com (domain + subdomains).
+EOF
+}
+
+main() {
+  local cmd=${1-help}; (($#)) && shift
+  case $cmd in
+    help|-h|--help) usage; return 0 ;;
+    version|--version) echo "paddock $PADDOCK_VERSION"; return 0 ;;
+  esac
+  ((EUID != 0)) || die "run paddock as a normal user, not root"
+  need_cmd podman
+  init_config_dir
+  case $cmd in
+    create)   cmd_create "$@" ;;
+    start)    cmd_start "$@" ;;
+    attach)   cmd_attach "$@" ;;
+    shell)    cmd_shell "$@" ;;
+    stop)     cmd_stop "$@" ;;
+    rm)       cmd_rm "$@" ;;
+    recreate) cmd_recreate "$@" ;;
+    list|ls)  cmd_list "$@" ;;
+    domains)  cmd_domains "$@" ;;
+    logs)     cmd_logs "$@" ;;
+    build)    cmd_build "$@" ;;
+    *) usage >&2; die "unknown command '$cmd'" ;;
+  esac
+}
+
+main "$@"
