@@ -122,6 +122,16 @@ check_not "script removed" test -e "/home/$U/.local/bin/paddock"
 check_not "data dir removed" test -e "/home/$U/.local/share/paddock"
 check "config dir kept" test -f "/home/$U/.config/paddock/domains.txt"
 
+section "uninstall --purge"
+check_not "--purge without --uninstall refused" as_user "$SRC/install.sh --purge"
+check_not "--uninstall --purge refused as root" "$SRC/install.sh" --uninstall --purge --force
+check "reinstall" as_user "$SRC/install.sh"
+check "install.sh --uninstall --purge --force" as_user "$SRC/install.sh --uninstall --purge --force"
+check_not "config dir removed" test -e "/home/$U/.config/paddock"
+check_not "script removed" test -e "/home/$U/.local/bin/paddock"
+check "paddock purge: nothing left to purge" \
+  out_has "$(as_user "$SRC/paddock purge --force" 2>&1)" 'nothing to purge'
+
 section "system install (/usr/local, as root)"
 check "install.sh as root" "$SRC/install.sh"
 check "script in /usr/local/bin" test -x /usr/local/bin/paddock
