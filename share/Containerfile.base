@@ -1,0 +1,23 @@
+# paddock base image for all agent tools. Built by `paddock build <tool>`;
+# each tool's Containerfile starts FROM this image.
+ARG BASE_IMAGE=docker.io/library/archlinux:latest
+FROM ${BASE_IMAGE}
+
+RUN pacman -Syu --noconfirm --needed \
+      bash ca-certificates curl git less nodejs npm procps-ng python ripgrep \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+
+# No sudo (not in the base image); strip setuid/setgid bits. git is for local
+# commits/diffs only: push and pull happen on the host, not in the instance.
+RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
+ && mkdir -p /home/agent /workspace && chmod 0777 /home/agent
+
+# Sandbox notes for the agent; the workspace AGENTS.md written by paddock
+# points here.
+COPY PADDOCK.md /etc/paddock/PADDOCK.md
+RUN chmod 0644 /etc/paddock/PADDOCK.md
+
+ENV HOME=/home/agent
+WORKDIR /workspace
+LABEL paddock.image=base
+CMD ["sleep", "infinity"]

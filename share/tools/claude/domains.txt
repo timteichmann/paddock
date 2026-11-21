@@ -1,0 +1,4 @@
+# Domains every Claude Code instance may reach (API and login).
+api.anthropic.com
+claude.ai
+platform.claude.com
