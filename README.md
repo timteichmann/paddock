@@ -65,7 +65,9 @@ sudo ./install.sh                  # system-wide: /usr/local
 `install.sh` only copies files; it never installs packages or touches your
 config. As a user it runs `paddock doctor` at the end. Running it again
 updates the installation, and `./install.sh --uninstall [--prefix DIR]`
-removes it. Your config, instances and Podman images are kept. For distro packages,
+removes it. Your config, instances and Podman images are kept. To remove those
+as well, run `./install.sh --uninstall --purge`, which runs `paddock purge` first.
+For distro packages,
 `DESTDIR=$pkgdir ./install.sh --prefix /usr` stages the files.
 
 ### Arch Linux package
@@ -81,7 +83,11 @@ makepkg -si
 To upgrade, run `git pull` and `makepkg -si` again. The version is the script
 version plus the commit, e.g. `0.1.0.r3.gbaed21f`, so each pulled commit is an
 upgrade for pacman. Uncommitted changes in the checkout are packaged too.
-`sudo pacman -R paddock` removes it and keeps your config.
+
+`sudo pacman -R paddock` removes the package. pacman never touches home
+directories, so your instances, images and `~/.config/paddock` stay. To remove them,
+run `paddock purge` as your user first. pacman reminds you on install, and
+after removal it prints the manual clean-up commands.
 
 paddock looks for the data directory in `$PADDOCK_DATA_DIR`, then `share/` next
 to the (symlink-resolved) script, then `<prefix>/share/paddock` for a script in
@@ -116,6 +122,7 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
 | `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
 | `tools` | available tools, their built version and where their definition comes from |
+| `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir. Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
 | `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |
 
 `attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the

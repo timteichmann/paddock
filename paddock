@@ -890,6 +890,81 @@ cmd_tools() {
   done < <(list_tools)
 }
 
+# ------------------------------------------------------------------ purge --
+
+# Names of all paddock instances: configured ones plus any whose podman
+# objects are left over without a config.
+all_instance_names() {
+  local d
+  for d in "$INSTANCES_DIR"/*/; do basename "$d"; done
+  {
+    podman ps -a --filter "label=$LABEL_KEY" --format "{{index .Labels \"$LABEL_KEY\"}}"
+    podman volume ls --filter "label=$LABEL_KEY" --format "{{index .Labels \"$LABEL_KEY\"}}"
+    # Network labels cannot be indexed in every podman version; use the name.
+    podman network ls --filter "label=$LABEL_KEY" --format '{{.Name}}' | sed -nE 's/^pd-(.+)-(int|ext)$/\1/p'
+  } 2>/dev/null
+}
+
+# paddock images, tool images first so the base they build on goes last.
+paddock_images() {
+  # Exact prefix match: podman's reference filter would also match e.g.
+  # localhost/my-paddock-x.
+  podman images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | sort -u \
+    | awk -v pre="$AGENT_IMAGE_PREFIX" -v b="$BASE_IMAGE" -v p="$PROXY_IMAGE" '
+        index($0, pre) != 1 || /<none>/ { next }
+        $0 == b || $0 == p { last = last $0 "\n"; next }
+        { print }
+        END { printf "%s", last }'
+}
+
+# Removes everything paddock created for this user: all instances (containers,
+# networks, home volumes), the paddock images and the config dir. Workspaces
+# are never touched. Meant to run before uninstalling paddock.
+cmd_purge() {
+  local force=0 keep_images=0 a
+  for a; do
+    case $a in
+      -f|--force) force=1 ;;
+      --keep-images) keep_images=1 ;;
+      *) die "usage: paddock purge [--force] [--keep-images]" ;;
+    esac
+  done
+  local -a names=() images=()
+  if command -v podman >/dev/null 2>&1; then
+    mapfile -t names < <(all_instance_names | grep -E "$NAME_RE" | sort -u)
+    ((keep_images)) || mapfile -t images < <(paddock_images)
+  else
+    warn "podman not found; only removing the config dir"
+    local d; for d in "$INSTANCES_DIR"/*/; do names+=("$(basename "$d")"); done
+  fi
+
+  if ((${#names[@]} == 0 && ${#images[@]} == 0)) && [[ ! -e $CONFIG_DIR ]]; then
+    info "nothing to purge"; return 0
+  fi
+  {
+    echo "paddock purge removes:"
+    local n ws
+    for n in "${names[@]}"; do
+      if ws=$(cat "$INSTANCES_DIR/$n/workspace" 2>/dev/null); then ws="workspace $ws is kept"
+      else ws="no config left"; fi
+      printf '  instance %-20s containers, networks, home volume (login); %s\n' "$n" "$ws"
+    done
+    for n in "${images[@]}"; do printf '  image    %s\n' "$n"; done
+    [[ -e $CONFIG_DIR ]] && printf '  config   %s (settings, overrides, instance definitions)\n' "$CONFIG_DIR"
+  } >&2
+  if ((!force)); then
+    confirm "Remove all of this? This cannot be undone." || die "aborted"
+  fi
+
+  for n in "${names[@]}"; do remove_podman_objects "$n"; info "removed instance '$n'"; done
+  for n in "${images[@]}"; do
+    if podman rmi "$n" >/dev/null 2>&1; then info "removed image $n"
+    else warn "could not remove image $n (still used by a container?)"; fi
+  done
+  if [[ -e $CONFIG_DIR ]]; then rm -rf -- "$CONFIG_DIR"; info "removed $CONFIG_DIR"; fi
+  info "purge done; workspaces were not touched"
+}
+
 # ----------------------------------------------------------------- doctor --
 
 # os_release KEY: value of KEY in /etc/os-release (empty if unset).
@@ -1007,6 +1082,7 @@ Usage: paddock <command> [args]
   build <tool> [--version X]                          build proxy, base and tool images
   tools                                               list available tools
   doctor                                              check that this host can run paddock
+  purge [--force] [--keep-images]                     remove all instances, images and config
 
 Tools:   $( [[ -n $DATA_DIR ]] && list_tools | paste -sd' ')
 Config:  $CONFIG_DIR (a file here overrides the data dir file at the same path)
@@ -1023,6 +1099,9 @@ main() {
     doctor) cmd_doctor "$@"; return ;;
   esac
   ((EUID != 0)) || die "run paddock as a normal user, not root"
+  # Before init_config_dir: works without a data dir and must not recreate
+  # the config dir it is about to delete.
+  [[ $cmd == purge ]] && { cmd_purge "$@"; return; }
   need_cmd podman
   init_config_dir
   case $cmd in

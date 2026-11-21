@@ -71,8 +71,38 @@ no_path() {
 proxy_ip() { podman inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "pd-'"$1"'-int"}}{{$v.IPAddress}}{{end}}{{end}}' "pd-$1-proxy"; }
 cfg_dir() { printf '%s/paddock' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 
+# The purge test removes the paddock images and config dir. It keeps them by
+# tagging the images under a backup name first (podman keeps the layers) and
+# copying the config dir; purge_restore puts both back, also from cleanup.
+PURGE_CFG_BAK=""
+declare -a PURGE_TAGS=()
+bak_tag() { printf 'localhost/pdtest-bak-%s' "${1#localhost/}"; }
+purge_restore() {
+  local t
+  for t in "${PURGE_TAGS[@]}"; do
+    podman tag "$(bak_tag "$t")" "$t" >/dev/null 2>&1 && podman rmi "$(bak_tag "$t")" >/dev/null 2>&1
+  done
+  PURGE_TAGS=()
+  if [[ -n $PURGE_CFG_BAK ]]; then
+    rm -rf "$(cfg_dir)" && cp -a "$PURGE_CFG_BAK" "$(cfg_dir)" && rm -rf "$PURGE_CFG_BAK"
+    PURGE_CFG_BAK=""
+  fi
+}
+paddock_images() { podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/paddock-'; }
+# Instances other than the given ones: configured, or with podman objects left.
+other_instances() {
+  local keep=" $* "
+  {
+    ls "$(cfg_dir)/instances" 2>/dev/null
+    podman ps -a --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
+    podman volume ls --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
+    podman network ls --filter label=paddock.instance --format '{{.Name}}' | sed -nE 's/^pd-(.+)-(int|ext)$/\1/p'
+  } | sort -u | while read -r n; do [[ -n $n && $keep != *" $n "* ]] && echo "$n"; done
+}
+
 cleanup() {
   local rc=$?
+  purge_restore
   if [[ ${PD_TEST_KEEP:-0} == 1 && $FAIL -gt 0 ]]; then
     echo "PD_TEST_KEEP=1: leaving $T1/$T2 in place"; return "$rc"
   fi
@@ -266,6 +296,45 @@ check "recreate t3" pd recreate t3
 check_not "recreate respects --no-agents-md" test -e "$WS3/AGENTS.md"
 check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
+
+section "extra: purge"
+# purge removes *all* instances of this user, so it only runs when no
+# instances other than the test's own exist.
+others=$(other_instances "$T2" t3 | paste -sd' ')
+if [[ -n $others ]]; then
+  skip "purge test: other paddock instances exist ($others)"
+else
+  WS3=/tmp/pd-t3
+  rm -rf "$WS3"
+  pd create claude t3 "$WS3" >/dev/null 2>&1 && pd start t3 >/dev/null 2>&1
+  PURGE_CFG_BAK=$(mktemp -d)/paddock
+  cp -a "$(cfg_dir)" "$PURGE_CFG_BAK"
+  mapfile -t PURGE_TAGS < <(paddock_images)
+  for t in "${PURGE_TAGS[@]}"; do podman tag "$t" "$(bak_tag "$t")"; done
+  check "images present before purge (${#PURGE_TAGS[@]})" test "${#PURGE_TAGS[@]}" -gt 0
+  # Leave $T2's podman objects without a config: purge must still find them.
+  rm -rf "$(cfg_dir)/instances/$T2"
+  out=$(setsid -w "$PADDOCK" purge </dev/null 2>&1)
+  check_not "purge without a terminal refuses (needs --force)" setsid -w "$PADDOCK" purge
+  check "... after listing t3, the images and the config dir" \
+    bash -c "grep -q 'instance t3 ' <<<\"\$1\" && grep -q 'image    localhost/paddock-' <<<\"\$1\" && grep -qF 'config   $(cfg_dir)' <<<\"\$1\"" _ "$out"
+  check "... including $T2, whose config is gone" bash -c "grep -q 'instance $T2 .*no config left' <<<\"\$1\"" _ "$out"
+  check "... and removes nothing" bash -c "'$PADDOCK' list | awk '\$1==\"t3\" {print \$2}' | grep -qx running && podman container exists pd-$T2-agent"
+  check "purge --force --keep-images" pd purge --force --keep-images
+  check_not "no labelled containers, volumes or networks remain" \
+    bash -c "$(declare -f other_instances cfg_dir); other_instances | grep -q ."
+  check_not "config dir removed" test -e "$(cfg_dir)"
+  check "workspaces kept" test -d "$WS3" -a -d "$WS2"
+  check "--keep-images kept the images" test "$(paddock_images | wc -l)" -eq "${#PURGE_TAGS[@]}"
+  check "purge --force removes the images" pd purge --force
+  check_not "no localhost/paddock-* images remain" bash -c "$(declare -f paddock_images); paddock_images | grep -q ."
+  check "other images kept (backup tags)" podman image exists "$(bak_tag "${PURGE_TAGS[0]}")"
+  check_not "config dir not recreated" test -e "$(cfg_dir)"
+  check "purge again: nothing to purge" bash -c "'$PADDOCK' purge --force 2>&1 | grep -q 'nothing to purge'"
+  purge_restore
+  check "images and config restored" bash -c "'$PADDOCK' tools | grep -qv 'not built'"
+  rm -rf "$WS3"
+fi
 
 # --------------------------------------------------------------- summary --
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

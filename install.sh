@@ -8,26 +8,29 @@
 #   ./install.sh --prefix /usr       any prefix (<prefix>/bin, <prefix>/share/paddock)
 #   DESTDIR=pkg ./install.sh --prefix /usr     staged install for packagers
 #   ./install.sh --uninstall [--prefix DIR]
+#   ./install.sh --uninstall --purge [--force]   also `paddock purge` first
 #
-# Never touches ~/.config/paddock (your instances, overrides and config) or
-# any Podman images, containers or volumes.
+# Without --purge, never touches ~/.config/paddock (your instances, overrides
+# and config) or any Podman images, containers or volumes.
 
 set -euo pipefail
 
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DESTDIR=${DESTDIR-}
-prefix="" uninstall=0
+prefix="" uninstall=0 purge=0 force=0
 
 die() { printf 'install.sh: error: %s\n' "$*" >&2; exit 1; }
 say() { printf 'install.sh: %s\n' "$*"; }
 
-usage() { sed -n '5,13s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '5,14s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"; }
 
 while (($#)); do
   case $1 in
     --prefix) (($# >= 2)) || die "--prefix needs a value"; prefix=$2; shift 2 ;;
     --prefix=*) prefix=${1#*=}; shift ;;
     --uninstall) uninstall=1; shift ;;
+    --purge) purge=1; shift ;;
+    -f|--force) force=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument '$1'" ;;
   esac
@@ -38,6 +41,8 @@ if [[ -z $prefix ]]; then
 fi
 [[ $prefix == /* ]] || die "--prefix must be an absolute path"
 prefix=${prefix%/}
+((purge && !uninstall)) && die "--purge only goes with --uninstall"
+((force && !purge)) && die "--force only goes with --purge"
 
 bin=$DESTDIR$prefix/bin/paddock
 data=$DESTDIR$prefix/share/paddock
@@ -45,6 +50,15 @@ doc=$DESTDIR$prefix/share/doc/paddock
 
 # --------------------------------------------------------------- uninstall --
 if ((uninstall)); then
+  if ((purge)); then
+    # paddock state is per user (rootless Podman, ~/.config), so purge as root
+    # would only clean up root's.
+    ((EUID != 0)) || die "--purge removes your user's instances, images and config; run it as that user, not root"
+    [[ -z $DESTDIR ]] || die "--purge does not go with DESTDIR"
+    p=$bin; [[ -x $p ]] || p=$SRC/paddock
+    args=(); ((force)) && args=(--force)
+    "$p" purge "${args[@]}" || die "paddock purge failed; nothing uninstalled"
+  fi
   removed=0
   if [[ -f $bin ]]; then
     grep -q '^# paddock - isolated coding-agent instances' "$bin" \
@@ -57,7 +71,7 @@ if ((uninstall)); then
   fi
   if [[ -d $doc ]]; then rm -rf "$doc"; say "removed $doc"; removed=1; fi
   ((removed)) || say "nothing installed under $DESTDIR$prefix"
-  say "kept your config and instances in \${XDG_CONFIG_HOME:-~/.config}/paddock"
+  ((purge)) || say "kept your config and instances in \${XDG_CONFIG_HOME:-~/.config}/paddock (remove them with 'paddock purge')"
   exit 0
 fi
 

@@ -66,7 +66,10 @@ check "contains /usr/share/paddock/tools/claude/tool.conf" out_has "$files" '^/u
 check_not "nothing outside /usr" bash -c "grep -v '^/usr/' <<<'$files' | grep -q ."
 
 section "install"
-check "pacman -U pulls in the dependencies" pacman -U --noconfirm "$pkgfile"
+out=$(pacman -U --noconfirm "$pkgfile" 2>&1); rc=$?
+check "pacman -U pulls in the dependencies" test "$rc" -eq 0
+check "install message points to paddock doctor and purge" \
+  bash -c "grep -q 'paddock doctor' <<<\"\$1\" && grep -q 'paddock purge' <<<\"\$1\"" _ "$out"
 for p in podman netavark curl; do check "dependency $p installed" pacman -Q "$p"; done
 check "pacman -Qkk paddock: files intact" pacman -Qkk paddock
 check "/usr/bin/paddock is executable" test -x /usr/bin/paddock
@@ -90,10 +93,18 @@ check "upgrade installed the change" grep -qx '# local change' /usr/share/paddoc
 
 section "remove"
 as "$U" 'mkdir -p ~/.config/paddock && echo pypi.org > ~/.config/paddock/domains.txt'
-check "pacman -R paddock" pacman -R --noconfirm paddock
+out=$(pacman -R --noconfirm paddock 2>&1); rc=$?
+check "pacman -R paddock" test "$rc" -eq 0
+check "remove message lists the manual clean-up" bash -c "grep -q 'rm -rf ~/.config/paddock' <<<\"\$1\"" _ "$out"
 check_not "/usr/bin/paddock removed" test -e /usr/bin/paddock
 check_not "/usr/share/paddock removed" test -e /usr/share/paddock
 check "user config kept" test -f "/home/$U/.config/paddock/domains.txt"
+
+section "purge before removing"
+check "reinstall" pacman -U --noconfirm "$pkgfile"
+check "paddock purge --force as the user" as "$U" paddock purge --force
+check_not "user config removed" test -e "/home/$U/.config/paddock"
+check "pacman -R paddock" pacman -R --noconfirm paddock
 
 printf '\narch-pkg: %d passed, %d failed\n' "$PASS" "$FAIL"
 if ((FAIL)); then printf '  - %s\n' "${FAILED[@]}"; exit 1; fi

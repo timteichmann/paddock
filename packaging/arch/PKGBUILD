@@ -8,7 +8,8 @@
 #   cd packaging/arch && makepkg -si
 #
 # After a `git pull`, run it again to upgrade. Uncommitted changes in the
-# checkout are packaged too.
+# checkout are packaged too. Before `pacman -R paddock`, run `paddock purge`
+# as each user to remove their instances, images and config.
 
 pkgname=paddock
 pkgver=0.1.0
@@ -19,6 +20,7 @@ url='https://github.com/timteichmann/paddock'
 license=('GPL-2.0-or-later')
 depends=('bash' 'coreutils' 'curl' 'findutils' 'gawk' 'grep' 'netavark' 'podman>=4.4' 'sed' 'shadow')
 makedepends=('git')
+install=paddock.install
 
 # makepkg's $srcdir is packaging/arch/src inside the checkout.
 _repo() { realpath "$srcdir/../../.."; }
