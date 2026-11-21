@@ -1,6 +1,7 @@
 # paddock
 
-Isolated coding-agent instances (Claude Code first) on rootless Podman. Each
+Isolated coding-agent instances on rootless Podman. Supported tools: Claude Code
+(`claude`); more can be added as tool definitions. Each
 instance sees exactly one host directory and can reach only an allowlist of
 domains, enforced by a per-instance Squid proxy that is the agent's only way out.
 
@@ -28,28 +29,40 @@ sudo pacman -S podman
 
 ## Images
 
-Both images are built from `archlinux:latest`. The agent image has bash, git,
-ripgrep, curl, python, nodejs/npm, and Claude Code at a pinned version from
-npm (`paddock build --version X`; without `--version`, the latest version is
-resolved and pinned). No sudo is installed, and setuid bits are stripped.
-The agent runs with `DISABLE_AUTOUPDATER=1` and
+All images are built from `archlinux:latest`:
+
+- `paddock-proxy`: Squid only.
+- `paddock-base`: bash, git, ripgrep, curl, python and nodejs/npm. No sudo is
+  installed, and setuid bits are stripped.
+- `paddock-<tool>:<version>`: `FROM paddock-base`, plus the tool at a pinned
+  version (`paddock build <tool> --version X`; without `--version`, the latest
+  version of the tool's npm package is resolved and pinned).
+
+Claude Code runs with `DISABLE_AUTOUPDATER=1` and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry, error reporting
 or update checks), so only the allowlisted API and login hosts are contacted.
-
-The Containerfiles are written to `~/.config/paddock/` on first run and can be
-edited there. Arch is rolling, so a rebuild picks up current packages.
+Arch is rolling, so a rebuild picks up current packages.
 
 ## Install
 
+paddock is the `paddock` script plus its data directory `share/` (defaults and
+tool definitions):
+
 ```bash
 install -Dm755 paddock ~/.local/bin/paddock
+mkdir -p ~/.local/share/paddock && cp -r share/. ~/.local/share/paddock/
 ```
+
+paddock looks for the data directory in `$PADDOCK_DATA_DIR`, then `share/` next
+to the (symlink-resolved) script, then `~/.local/share/paddock`,
+`/usr/local/share/paddock` and `/usr/share/paddock`. Running `./paddock` from a
+checkout uses the checkout's `share/`.
 
 ## Quick start
 
 ```bash
-paddock build                       # builds paddock-proxy and paddock-agent:<latest>
-paddock create web ~/src/web --domains pypi.org,.githubusercontent.com
+paddock build claude                # builds paddock-proxy, paddock-base and paddock-claude:<latest>
+paddock create claude web ~/src/web --domains pypi.org,.githubusercontent.com
 paddock attach web                  # starts if needed, runs claude in /workspace
 ```
 
@@ -61,16 +74,17 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <name> <path> [--domains d1,d2]` | create (not started). Refuses `/`, `$HOME`, parents of `$HOME`, and the paddock config dir |
+| `create <tool> <name> <path> [--domains d1,d2]` | create (not started). The tool is fixed for the instance. Refuses `/`, `$HOME`, parents of `$HOME`, and the paddock config dir |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
-| `attach <name> [--yolo] [-- claude args]` | `--yolo` adds `--dangerously-skip-permissions` (prints a warning) |
+| `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
 | `rm <name> [--force]` | removes containers, networks, home volume and config. Never touches the workspace |
 | `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login) |
-| `list` | name, state, number of extra domains, workspace |
+| `list` | name, state, tool, number of extra domains, workspace |
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
-| `build [--version X]` | without `--version`, the latest npm version is resolved and pinned |
+| `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
+| `tools` | available tools, their built version and where their definition comes from |
 
 `attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the
 instance, so Claude Code shows full colors. If the agent image has no terminfo
@@ -85,24 +99,50 @@ treats them as fatal.
 
 ## Files
 
+Shipped defaults live in the data directory (`share/` in the repository):
+
+```
+share/
+  config                      default limits and relabel flag
+  domains.txt                 domains every instance may reach (empty by default)
+  Containerfile.proxy
+  Containerfile.base          shared base of all agent images
+  tools/<tool>/
+    tool.conf                 command, yolo_args, npm_package
+    Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
+    domains.txt               domains every instance of this tool may reach
+    env                       environment set in the agent container (KEY=VALUE)
+```
+
+Your own files live in the config directory. A file there at the same relative
+path as a data file replaces it, e.g. `~/.config/paddock/domains.txt` or
+`~/.config/paddock/tools/claude/Containerfile`. `config` is the exception: its
+keys are merged over the defaults, so it only needs the settings you change. A
+new directory `~/.config/paddock/tools/<tool>/` with a `tool.conf` and a
+`Containerfile` adds a tool.
+
 ```
 ~/.config/paddock/            (mode 0700, never mounted into the agent)
-  config                      limits, relabel flag, pinned agent_version
-  base-domains.txt            applies to every instance
-  Containerfile.agent         editable; used by `paddock build`
-  Containerfile.proxy
+  config                      optional: settings that differ from share/config
+  images                      written by `paddock build`: built version per tool
   build/                      optional extra build-context files (e.g. a corporate CA)
   squid-extra.conf            optional, included at the end of every squid.conf (e.g. cache_peer)
+  ...                         optional overrides of data files (see above)
   instances/<name>/
+    tool                      the instance's tool
     workspace                 absolute host path
     domains.txt               per-instance extra domains
     proxy/                    generated: squid.conf + allowlist.txt (mounted read-only into the proxy)
 ```
 
+An instance's allowlist is `domains.txt` + `tools/<tool>/domains.txt` +
+`instances/<name>/domains.txt`; `paddock domains <name> list` shows each entry's
+source.
+
 `config` settings (empty value disables a limit): `agent_memory=4g`,
 `agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
-`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit changes
-take effect on `paddock recreate <name>`.
+`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit and `env`
+changes take effect on `paddock recreate <name>`.
 
 ### Git
 

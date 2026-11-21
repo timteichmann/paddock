@@ -1,0 +1,17 @@
+# paddock agent image for Claude Code. Built by `paddock build claude [--version X]`.
+ARG PADDOCK_BASE=localhost/paddock-base:latest
+FROM ${PADDOCK_BASE}
+
+ARG TOOL_VERSION
+RUN test -n "$TOOL_VERSION" || { echo "TOOL_VERSION build arg is required" >&2; exit 1; }
+
+# Current npm blocks install scripts by default; Claude Code's postinstall
+# links its platform-native binary, so allow scripts for that package only.
+# The setuid strip is repeated in case the install added such files.
+RUN npm install -g --no-fund --no-audit --allow-scripts=@anthropic-ai/claude-code \
+      "@anthropic-ai/claude-code@${TOOL_VERSION}" \
+ && npm cache clean --force \
+ && claude --version \
+ && find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
+
+LABEL paddock.image=agent paddock.tool=claude
