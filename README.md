@@ -96,7 +96,6 @@ treats them as fatal.
   instances/<name>/
     workspace                 absolute host path
     domains.txt               per-instance extra domains
-    env                       optional KEY=VALUE file passed to attach/shell (e.g. GH_TOKEN for git push)
     proxy/                    generated: squid.conf + allowlist.txt (mounted read-only into the proxy)
 ```
 
@@ -105,18 +104,12 @@ treats them as fatal.
 `proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit changes
 take effect on `paddock recreate <name>`.
 
-### Git push
+### Git
 
-Git over SSH is not supported (`git@github.com:` is rewritten to HTTPS). Put a
-fine-grained, repository-scoped token into `~/.config/paddock/instances/<name>/env`:
-
-```
-GH_TOKEN=github_pat_...
-```
-
-and allowlist `github.com` (plus `.githubusercontent.com` if needed), then inside
-the instance: `git config --global credential.helper '!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f'`.
-That git config lives in the instance's home volume.
+The workspace is a bind mount of a host directory, so do all remote git work
+(fetch, pull, push, PRs) on the host. Instances get no git credentials and need
+no access to GitHub or other forges; `git` in the image is for local commits,
+diffs and history in `/workspace`.
 
 ## How isolation works
 

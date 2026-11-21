@@ -184,6 +184,8 @@ check_not "no socket files anywhere (podman/ssh-agent/dbus/X11/wayland)" \
   bash -c "podman exec pd-$T1-agent find / \\( -path /proc -o -path /sys \\) -prune -o -type s -print 2>/dev/null | grep -q ."
 check_not "no session/socket env vars (SSH_AUTH_SOCK, DBUS, DISPLAY, ...)" \
   bash -c "podman exec pd-$T1-agent env | grep -qE '^(SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR)='"
+check_not "no git credentials or forge URL rewrites in the agent" \
+  bash -c "podman exec pd-$T1-agent git config --show-origin --list 2>/dev/null | grep -qiE 'credential|insteadof'"
 check_not "paddock config dir not mounted" \
   bash -c "podman exec pd-$T1-agent cat /proc/self/mountinfo | grep -qF '$(cfg_dir)'"
 check "workspace is the only host directory bind-mounted" \

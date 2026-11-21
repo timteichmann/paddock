@@ -148,12 +148,10 @@ RUN npm install -g --no-fund --no-audit --allow-scripts=@anthropic-ai/claude-cod
  && npm cache clean --force \
  && claude --version
 
-# No sudo (not in the base image); strip setuid/setgid bits; git over HTTPS only.
+# No sudo (not in the base image); strip setuid/setgid bits. git is for local
+# commits/diffs only: push and pull happen on the host, not in the instance.
 RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
- && mkdir -p /home/agent /workspace && chmod 0777 /home/agent \
- && git config --system url."https://github.com/".insteadOf "git@github.com:" \
- && git config --system --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
- && git config --system url."https://gitlab.com/".insteadOf "git@gitlab.com:"
+ && mkdir -p /home/agent /workspace && chmod 0777 /home/agent
 
 ENV HOME=/home/agent \
     DISABLE_AUTOUPDATER=1 \
@@ -518,12 +516,6 @@ start_instance() {
   ctr_running "$ac" || podman start "$ac" >/dev/null
 }
 
-# env-file arg for exec sessions (optional per-instance env file)
-exec_env_args() {
-  local f; f="$(instance_dir "$1")/env"
-  if [[ -f $f ]]; then printf -- '--env-file=%s\n' "$f"; fi
-}
-
 # Sets TTY_FLAG for podman exec. Not a $(...) helper: inside command
 # substitution stdout is a pipe, so [[ -t 1 ]] would always be false.
 set_tty_flag() { if [[ -t 0 && -t 1 ]]; then TTY_FLAG=-it; else TTY_FLAG=-i; fi; }
@@ -651,20 +643,18 @@ cmd_attach() {
     printf 'It will run commands and edit files in %s without asking.\n' "$(<"$(instance_dir "$name")/workspace")" >&2
     cargs=(--dangerously-skip-permissions "${cargs[@]}")
   fi
-  local -a envs; mapfile -t envs < <(exec_env_args "$name")
   local TTY_FLAG; set_tty_flag
   local -a tenvs; mapfile -t tenvs < <(term_env_args "$(agent_ctr "$name")")
-  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
+  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
 }
 
 cmd_shell() {
   (($# == 1)) || die "usage: paddock shell <name>"
   require_instance "$1"
   start_instance "$1"
-  local -a envs; mapfile -t envs < <(exec_env_args "$1")
   local TTY_FLAG; set_tty_flag
   local -a tenvs; mapfile -t tenvs < <(term_env_args "$(agent_ctr "$1")")
-  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "${envs[@]}" "$(agent_ctr "$1")" bash
+  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "$(agent_ctr "$1")" bash
 }
 
 cmd_rm() {
