@@ -350,6 +350,38 @@ check "start works again with the original directory" pd start t3
 check "rm t3" pd rm t3 --force
 rm -rf /tmp/pd-t3
 
+section "extra: per-instance packages"
+WS3=/tmp/pd-t3
+rm -rf "$WS3"
+check_not "create refuses an invalid package name" pd create claude t3 "$WS3" --packages '-rf'
+check_not "... and creates no instance" test -e "$(cfg_dir)/instances/t3"
+check_not "create with an unknown package fails" pd create claude t3 "$WS3" --packages paddock-no-such-package
+check_not "... and rolls back" test -e "$(cfg_dir)/instances/t3"
+check "create claude t3 --packages jq" pd create claude t3 "$WS3" --no-agents-md --packages jq
+check "instance image built" podman image exists localhost/paddock-inst:t3
+check "start t3" pd start t3
+check "jq installed in t3" ax t3 jq --version
+check_not "jq not in $T2 (tool image)" ax "$T2" sh -c 'command -v jq'
+check "list shows 1 package" bash -c "'$PADDOCK' list | awk '\$1==\"t3\" {print \$5}' | grep -qx 1"
+check_not "packages add of an unknown package fails" pd packages t3 add paddock-no-such-package
+check "... and leaves the list unchanged" test "$(pd packages t3 list)" = jq
+check "packages add tree" pd packages t3 add tree
+check "packages list shows jq and tree" test "$(pd packages t3 list | paste -sd,)" = jq,tree
+check "start warns until recreate" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'packages of .t3. changed'"
+check "recreate t3" pd recreate t3
+check "start t3, no warning" bash -c "! '$PADDOCK' start t3 2>&1 | grep -q 'packages of'"
+check "tree installed after recreate" ax t3 tree --version
+check_not "setuid bits stripped in the instance image" ax t3 sh -c 'find / -xdev -perm /6000 -type f 2>/dev/null | grep -q .'
+check "packages rm jq tree" pd packages t3 rm jq tree
+check "recreate t3 without packages" bash -c "'$PADDOCK' recreate t3 && '$PADDOCK' start t3"
+check_not "instance image removed" podman image exists localhost/paddock-inst:t3
+check_not "jq gone" ax t3 sh -c 'command -v jq'
+check "packages add jq again" bash -c "'$PADDOCK' packages t3 add jq && '$PADDOCK' recreate t3"
+check "rm t3" pd rm t3 --force
+check_not "rm removes the instance image" podman image exists localhost/paddock-inst:t3
+check_not "... and earlier untagged builds" bash -c "podman images -q --filter label=paddock.instance=t3 | grep -q ."
+rm -rf "$WS3"
+
 section "extra: purge"
 # purge removes *all* instances of this user, so it only runs when no
 # instances other than the test's own exist.

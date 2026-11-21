@@ -45,6 +45,8 @@ All images are built from `archlinux:latest`, whatever distro the host runs:
 - `paddock-<tool>:<version>`: `FROM paddock-base`, plus the tool at a pinned
   version (`paddock build <tool> --version X`; without `--version`, the latest
   version of the tool's npm package is resolved and pinned).
+- `paddock-inst:<name>`: only for instances with
+  [extra packages](#per-instance-packages): the tool image plus those packages.
 
 Claude Code runs with `DISABLE_AUTOUPDATER=1` and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry, error reporting
@@ -117,18 +119,19 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <tool> <name> <path> [--domains d1,d2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths). Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
+| `create <tool> <name> <path> [--domains d1,d2] [--packages p1,p2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths). Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
 | `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
 | `rm <name> [--force]` | removes containers, networks, home volume and config. Never touches the workspace |
 | `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login). Adds `AGENTS.md` to the workspace if missing |
-| `list` | name, state, tool, number of extra domains, workspace |
+| `list` | name, state, tool, number of extra domains and packages, workspace |
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
+| `packages <name> list\|add\|rm\|edit` | extra pacman packages for this instance, see [Per-instance packages](#per-instance-packages). Takes effect on `recreate` |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
 | `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
 | `tools` | available tools, their built version and where their definition comes from |
-| `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir. Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
+| `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir (`--keep-images` keeps the proxy, base and tool images; instance images go with their instance). Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
 | `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |
 
 `attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the
@@ -179,6 +182,7 @@ new directory `~/.config/paddock/tools/<tool>/` with a `tool.conf` and a
     tool                      the instance's tool
     workspace                 absolute host path
     domains.txt               per-instance extra domains
+    packages.txt              per-instance extra pacman packages (see below)
     proxy/                    generated: squid.conf + allowlist.txt (mounted read-only into the proxy)
 ```
 
@@ -192,12 +196,46 @@ source.
 (`no`: never add `AGENTS.md` to workspaces). Limit and `env` changes take effect
 on `paddock recreate <name>`.
 
+### Per-instance packages
+
+Packages that only one project needs (e.g. `godot` for a game) do not have to
+go into the shared Containerfiles. Like `domains.txt`, each instance has its own
+`packages.txt`:
+
+```bash
+paddock create claude game ~/src/game --packages godot
+paddock packages game add blender      # builds localhost/paddock-inst:game
+paddock recreate game                  # switches the instance to it
+paddock packages game list|rm|edit
+```
+
+- For an instance with packages, paddock builds `localhost/paddock-inst:<name>`
+  `FROM` the instance's tool image with
+  `pacman -Syu --noconfirm --needed <packages>` (a full upgrade, because Arch
+  does not support partial upgrades) and strips setuid bits again. Instances
+  without packages use the tool image directly.
+- The build runs on the host like `paddock build`, not through the instance's
+  proxy, so the Arch mirrors do not need to be allowlisted. The agent cannot
+  change the list; only you can.
+- `add`, `rm` and `edit` build the new image first and save the list only if
+  the build succeeds, so an unknown package changes nothing. The running
+  containers keep their image until `paddock recreate <name>`; `start` and
+  `attach` warn while the list and the containers differ.
+- `recreate` rebuilds the image when it is out of date, e.g. after
+  `paddock build <tool>` produced a new tool image. Without packages it
+  removes the instance image. `rm` removes it as well.
+- Names are official Arch repository packages or groups (`[A-Za-z0-9@._+-]`, not
+  starting with `-` or `.`). For AUR packages or anything else, override the
+  tool's Containerfile (see [Files](#files)); that applies to all instances of
+  the tool.
+
 ### Agent instructions
 
 The base image contains `/etc/paddock/PADDOCK.md`. It tells the agent what the
 sandbox looks like, and that it cannot widen it itself: when the proxy blocks a
 domain or it needs a system package, it should stop and ask you, giving the
-exact `paddock domains <instance> add ...` command or the Containerfile change.
+exact `paddock domains <instance> add ...` or `paddock packages <instance> add ...`
+command.
 The instance name comes from `$PADDOCK_INSTANCE`.
 
 So that agents read it, `create` and `recreate` write a short `AGENTS.md` into
