@@ -94,8 +94,8 @@ other_instances() {
   local keep=" $* "
   {
     ls "$(cfg_dir)/instances" 2>/dev/null
-    podman ps -a --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
-    podman volume ls --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
+    podman ps -a --filter label=paddock.instance --format '{{.Names}}' | sed -nE 's/^pd-(.+)-(agent|proxy)$/\1/p'
+    podman volume ls --filter label=paddock.instance --format '{{.Name}}' | sed -nE 's/^pd-(.+)-home$/\1/p'
     podman network ls --filter label=paddock.instance --format '{{.Name}}' | sed -nE 's/^pd-(.+)-(int|ext)$/\1/p'
   } | sort -u | while read -r n; do [[ -n $n && $keep != *" $n "* ]] && echo "$n"; done
 }
