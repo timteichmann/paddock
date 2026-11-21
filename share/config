@@ -6,7 +6,8 @@ agent_pids_limit=2048
 proxy_memory=256m
 proxy_cpus=0.5
 proxy_pids_limit=256
-# SELinux relabel flag for bind mounts: empty (Arch default), z or Z.
+# SELinux relabel flag for bind mounts: empty (hosts without SELinux), z or Z
+# (Fedora and other SELinux-enforcing hosts).
 relabel=
 # Add a default AGENTS.md (pointing to /etc/paddock/PADDOCK.md) to the
 # workspace on create/recreate if it has none: yes or no.

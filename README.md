@@ -19,17 +19,24 @@ domains, enforced by a per-instance Squid proxy that is the agent's only way out
 
 ## Requirements
 
-Arch Linux (or any distro with Podman ≥ 4.4 and netavark), rootless Podman with
-subuid/subgid configured, bash ≥ 4.4, curl. cgroup v2 delegation (Arch default)
-for the memory/CPU/pids limits. No root and no sudo at runtime.
+Any Linux distribution with:
 
-```bash
-sudo pacman -S podman
-```
+- rootless Podman ≥ 4.4 using the netavark network backend; install it with
+  your distribution's package manager, see Podman's
+  [installation guide](https://podman.io/docs/installation)
+- `newuidmap`/`newgidmap` and subuid/subgid entries for your user
+- bash ≥ 4.4 and curl
+- for the resource limits: cgroup v2 with the memory, cpu and pids controllers
+  delegated to your user (the systemd default on current distributions)
+
+On SELinux-enforcing hosts (e.g. Fedora), set `relabel=Z` in
+`~/.config/paddock/config`. No root and no sudo at runtime.
+
+`paddock doctor` checks all of this and says what is missing and how to fix it.
 
 ## Images
 
-All images are built from `archlinux:latest`:
+All images are built from `archlinux:latest`, whatever distro the host runs:
 
 - `paddock-proxy`: Squid only.
 - `paddock-base`: bash, git, ripgrep, curl, python and nodejs/npm. No sudo is
@@ -46,17 +53,25 @@ Arch is rolling, so a rebuild picks up current packages.
 ## Install
 
 paddock is the `paddock` script plus its data directory `share/` (defaults and
-tool definitions):
+tool definitions). From a checkout:
 
 ```bash
-install -Dm755 paddock ~/.local/bin/paddock
-mkdir -p ~/.local/share/paddock && cp -r share/. ~/.local/share/paddock/
+./install.sh                       # as a user: ~/.local/bin/paddock + ~/.local/share/paddock
+sudo ./install.sh                  # system-wide: /usr/local
+./install.sh --prefix /opt/paddock # any prefix: <prefix>/bin, <prefix>/share/paddock
 ```
 
+`install.sh` only copies files; it never installs packages or touches your
+config. As a user it runs `paddock doctor` at the end. Running it again
+updates the installation, and `./install.sh --uninstall [--prefix DIR]`
+removes it. Your config, instances and Podman images are kept. For distro packages,
+`DESTDIR=$pkgdir ./install.sh --prefix /usr` stages the files.
+
 paddock looks for the data directory in `$PADDOCK_DATA_DIR`, then `share/` next
-to the (symlink-resolved) script, then `~/.local/share/paddock`,
-`/usr/local/share/paddock` and `/usr/share/paddock`. Running `./paddock` from a
-checkout uses the checkout's `share/`.
+to the (symlink-resolved) script, then `<prefix>/share/paddock` for a script in
+`<prefix>/bin`, then `~/.local/share/paddock`, `/usr/local/share/paddock` and
+`/usr/share/paddock`. Running `./paddock` from a checkout uses the checkout's
+`share/`.
 
 ## Quick start
 
@@ -85,6 +100,7 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
 | `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
 | `tools` | available tools, their built version and where their definition comes from |
+| `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |
 
 `attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the
 instance, so Claude Code shows full colors. If the agent image has no terminfo
@@ -199,10 +215,21 @@ diffs and history in `/workspace`.
 ## Tests
 
 ```bash
-tests/acceptance.sh
+shellcheck paddock install.sh tests/*.sh
+tests/distro.sh              # install tests in fresh ubuntu and arch containers
+tests/acceptance.sh          # full suite on this host, after `paddock build claude`
 ```
 
-Creates `t1`/`t2` (workspaces `/tmp/pd-t1`, `/tmp/pd-t2`), runs spec tests 1–11
+`tests/distro.sh [ubuntu] [debian] [arch] [fedora]` runs `tests/install-test.sh`
+in a fresh container per distro (podman or docker). It installs the host
+packages, checks the `paddock doctor` hints before and after, and runs
+`install.sh` with a user, system, custom and `DESTDIR` prefix, a reinstall and an
+uninstall. It does not start instances, because that would need nested
+rootless Podman. Behind a proxy, pass
+`PD_ENGINE_ARGS=--network=host` and `PD_TEST_CA=/path/ca.crt` (HTTP(S)_PROXY are
+passed through).
+
+`tests/acceptance.sh` creates `t1`/`t2` (workspaces `/tmp/pd-t1`, `/tmp/pd-t2`), runs spec tests 1–11
 plus extra checks, and cleans up. Overrides: `PD_TEST_DENIED` (domain toggled in
 test 5, default `example.com`), `PD_TEST_DOMAIN2` (default `example.org`),
 `PD_TEST_PUBLIC_DNS=0` (skip the nip.io private-IP check), `PD_TEST_KEEP=1`.

@@ -102,7 +102,8 @@ CREATED_WS1=1 CREATED_WS2=1
 section "11. runs as a normal user (checked up front)"
 check_not "not running as root (EUID=$EUID)" test "$EUID" -eq 0
 check "podman is rootless" test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
-check_not "paddock never invokes sudo" bash -c "grep -vE '^[[:space:]]*#' '$PADDOCK' | grep -qE '(^|[^a-z_])sudo[[:space:]]'"
+# Quoted strings are dropped first: `paddock doctor` prints "sudo ..." fix hints.
+check_not "paddock never invokes sudo" bash -c "grep -vE '^[[:space:]]*#' '$PADDOCK' | sed -E 's/\"[^\"]*\"//g' | grep -qE '(^|[^a-z_])sudo[[:space:]]'"
 
 section "1. create + start + list"
 check "create claude $T1 $WS1 --domains pypi.org" pd create claude "$T1" "$WS1" --domains pypi.org
