@@ -1188,6 +1188,8 @@ main() {
     help|-h|--help) DATA_DIR=$(find_data_dir 2>/dev/null) || DATA_DIR=""; usage; return 0 ;;
     version|--version) echo "paddock $PADDOCK_VERSION"; return 0 ;;
     doctor) cmd_doctor "$@"; return ;;
+    # For shell completion: no podman, no config dir created, no errors.
+    __complete-tools) DATA_DIR=$(find_data_dir 2>/dev/null) || return 0; list_tools; return 0 ;;
   esac
   ((EUID != 0)) || die "run paddock as a normal user, not root"
   # Before init_config_dir: works without a data dir and must not recreate

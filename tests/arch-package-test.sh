@@ -63,6 +63,7 @@ check_not "namcap package: no errors" out_has "$out" ' E: '
 files=$(pacman -Qlp "$pkgfile" 2>/dev/null | awk '{print $2}')
 check "contains /usr/bin/paddock" out_has "$files" '^/usr/bin/paddock$'
 check "contains /usr/share/paddock/tools/claude/tool.conf" out_has "$files" '^/usr/share/paddock/tools/claude/tool.conf$'
+check "contains the bash completion" out_has "$files" '^/usr/share/bash-completion/completions/paddock$'
 check_not "nothing outside /usr" bash -c "grep -v '^/usr/' <<<'$files' | grep -q ."
 
 section "install"

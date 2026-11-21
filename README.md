@@ -70,6 +70,12 @@ as well, run `./install.sh --uninstall --purge`, which runs `paddock purge` firs
 For distro packages,
 `DESTDIR=$pkgdir ./install.sh --prefix /usr` stages the files.
 
+It also installs bash completion (commands, options, instance and tool names,
+and allowlisted domains for `domains <name> rm`) to
+`<prefix>/share/bash-completion/completions/paddock`, which the
+`bash-completion` package loads automatically. Without an install, run
+`source completions/paddock.bash`.
+
 ### Arch Linux package
 
 `packaging/arch/PKGBUILD` packages the checkout it sits in. It downloads
@@ -273,7 +279,7 @@ mounted read-only as a whole.
 ## Tests
 
 ```bash
-shellcheck paddock install.sh tests/*.sh
+shellcheck paddock install.sh completions/paddock.bash tests/*.sh
 tests/distro.sh              # install tests in fresh ubuntu and arch containers
 tests/distro.sh arch-pkg     # build, namcap, install and remove the Arch package
 tests/acceptance.sh          # full suite on this host, after `paddock build claude`

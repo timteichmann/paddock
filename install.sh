@@ -47,6 +47,9 @@ prefix=${prefix%/}
 bin=$DESTDIR$prefix/bin/paddock
 data=$DESTDIR$prefix/share/paddock
 doc=$DESTDIR$prefix/share/doc/paddock
+# bash-completion loads <prefix>/share/bash-completion/completions/<cmd> on
+# demand, including ~/.local/share (XDG_DATA_HOME) for user installs.
+comp=$DESTDIR$prefix/share/bash-completion/completions/paddock
 
 # --------------------------------------------------------------- uninstall --
 if ((uninstall)); then
@@ -70,6 +73,11 @@ if ((uninstall)); then
     rm -rf "$data"; say "removed $data"; removed=1
   fi
   if [[ -d $doc ]]; then rm -rf "$doc"; say "removed $doc"; removed=1; fi
+  if [[ -f $comp ]]; then
+    grep -q '^# bash completion for paddock' "$comp" \
+      || die "$comp is not paddock's completion; not removing it"
+    rm -f "$comp"; say "removed $comp"; removed=1
+  fi
   ((removed)) || say "nothing installed under $DESTDIR$prefix"
   ((purge)) || say "kept your config and instances in \${XDG_CONFIG_HOME:-~/.config}/paddock (remove them with 'paddock purge')"
   exit 0
@@ -79,8 +87,9 @@ fi
 [[ -f $SRC/paddock && -f $SRC/share/config && -d $SRC/share/tools ]] \
   || die "run install.sh from a paddock checkout ($SRC has no paddock or share/)"
 
-install -d -m 0755 "$(dirname "$bin")" "$doc"
+install -d -m 0755 "$(dirname "$bin")" "$doc" "$(dirname "$comp")"
 install -m 0755 "$SRC/paddock" "$bin"
+install -m 0644 "$SRC/completions/paddock.bash" "$comp"
 
 # Replace the data dir wholesale so files dropped upstream do not linger.
 # User overrides live in the config dir and are unaffected.
@@ -97,6 +106,7 @@ install -m 0644 "$SRC/README.md" "$SRC/LICENSE" "$doc/"
 
 say "installed $bin"
 say "installed $data"
+say "installed $comp"
 
 [[ -n $DESTDIR ]] && exit 0
 

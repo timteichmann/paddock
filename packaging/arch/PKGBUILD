@@ -19,6 +19,7 @@ arch=('any')
 url='https://github.com/timteichmann/paddock'
 license=('GPL-2.0-or-later')
 depends=('bash' 'coreutils' 'curl' 'findutils' 'gawk' 'grep' 'netavark' 'podman>=4.4' 'sed' 'shadow')
+optdepends=('bash-completion: tab completion for paddock')
 makedepends=('git')
 install=paddock.install
 

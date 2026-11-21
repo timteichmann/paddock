@@ -88,6 +88,7 @@ out=$(as_user "cd /tmp && $SRC/install.sh" 2>&1)
 check "install.sh as user" test -x "/home/$U/.local/bin/paddock"
 check "data dir installed" test -f "/home/$U/.local/share/paddock/tools/claude/tool.conf"
 check "doc installed" test -f "/home/$U/.local/share/doc/paddock/README.md"
+check "bash completion installed" test -f "/home/$U/.local/share/bash-completion/completions/paddock"
 check "files owned by the user" test "$(stat -c %U "/home/$U/.local/share/paddock/config")" = "$U"
 check "install.sh runs paddock doctor" out_has "$out" 'checking the host'
 check "paddock on PATH" test "$(as_user 'command -v paddock')" = "/home/$U/.local/bin/paddock"
@@ -96,6 +97,16 @@ check "paddock tools: claude from ~/.local/share" \
   out_has "$(as_user 'paddock tools')" "^claude .*/home/$U/.local/share/paddock/tools/claude$"
 check "paddock help shows the installed data dir" \
   out_has "$(as_user 'paddock help')" "^Data: +/home/$U/.local/share/paddock$"
+# Completion without bash-completion itself (its fallback path).
+complete_as_user() { # words... -> COMPREPLY
+  as_user "source ~/.local/share/bash-completion/completions/paddock
+    COMP_WORDS=($*); COMP_CWORD=\$((\${#COMP_WORDS[@]} - 1)); _paddock; echo \"\${COMPREPLY[*]}\""
+}
+check "completion: paddock cr -> create" test "$(complete_as_user paddock cr)" = create
+check "completion: paddock build '' -> claude" test "$(complete_as_user paddock build "''")" = claude
+check "completion: paddock purge --k -> --keep-images" \
+  test "$(complete_as_user paddock purge --k)" = --keep-images
+check_not "completion does not create the config dir" test -e "/home/$U/.config/paddock"
 out=$(as_user 'paddock doctor' 2>&1)
 check "doctor: podman version ok" out_has "$out" 'ok +podman [0-9]'
 check "doctor: newuidmap/newgidmap ok" out_has "$out" 'ok +newuidmap/newgidmap'
@@ -120,6 +131,7 @@ section "user uninstall"
 check "install.sh --uninstall" as_user "$SRC/install.sh --uninstall"
 check_not "script removed" test -e "/home/$U/.local/bin/paddock"
 check_not "data dir removed" test -e "/home/$U/.local/share/paddock"
+check_not "bash completion removed" test -e "/home/$U/.local/share/bash-completion/completions/paddock"
 check "config dir kept" test -f "/home/$U/.config/paddock/domains.txt"
 
 section "uninstall --purge"
@@ -159,6 +171,7 @@ section "staged install (DESTDIR, for packages)"
 check "DESTDIR=/tmp/stage install.sh --prefix /usr" env DESTDIR=/tmp/stage "$SRC/install.sh" --prefix /usr
 check "staged script" test -x /tmp/stage/usr/bin/paddock
 check "staged data dir" test -f /tmp/stage/usr/share/paddock/config
+check "staged bash completion" test -f /tmp/stage/usr/share/bash-completion/completions/paddock
 check_not "nothing written outside DESTDIR" test -e /usr/bin/paddock -o -e /usr/share/paddock
 cp -a /tmp/stage/usr/. /usr/
 check "packaged layout: paddock tools uses /usr/share/paddock" \
