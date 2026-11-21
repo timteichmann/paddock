@@ -427,11 +427,15 @@ reload_proxy() {
   fi
 }
 
+# Wait for this run's listening line. --since skips earlier runs' logs (the
+# container keeps them across restarts). No grep -q: it exits on the first
+# match, podman logs then dies of SIGPIPE, and pipefail fails the check.
 wait_proxy_ready() {
-  local pc=$1 ip=$2
+  local pc=$1 ip=$2 since=$3
   for _ in $(seq 1 50); do
     ctr_running "$pc" || break
-    if podman logs "$pc" 2>&1 | grep -q "Accepting HTTP Socket connections at.*$ip:$PROXY_PORT"; then
+    if podman logs --since "$since" "$pc" 2>&1 \
+        | grep "Accepting HTTP Socket connections at.*$ip:$PROXY_PORT" >/dev/null; then
       return 0
     fi
     sleep 0.2
@@ -507,8 +511,9 @@ start_instance() {
   [[ -d $ws ]] || die "workspace $ws does not exist"
   if ! ctr_running "$pc"; then
     generate_proxy_config "$name"
+    local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     podman start "$pc" >/dev/null
-    wait_proxy_ready "$pc" "$(proxy_ip "$name")"
+    wait_proxy_ready "$pc" "$(proxy_ip "$name")" "$since"
   fi
   ctr_running "$ac" || podman start "$ac" >/dev/null
 }
