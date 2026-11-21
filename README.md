@@ -74,12 +74,12 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <tool> <name> <path> [--domains d1,d2]` | create (not started). The tool is fixed for the instance. Refuses `/`, `$HOME`, parents of `$HOME`, and the paddock config dir |
+| `create <tool> <name> <path> [--domains d1,d2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses `/`, `$HOME`, parents of `$HOME`, and the paddock config dir. Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
 | `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
 | `rm <name> [--force]` | removes containers, networks, home volume and config. Never touches the workspace |
-| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login) |
+| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login). Adds `AGENTS.md` to the workspace if missing |
 | `list` | name, state, tool, number of extra domains, workspace |
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
@@ -107,6 +107,8 @@ share/
   domains.txt                 domains every instance may reach (empty by default)
   Containerfile.proxy
   Containerfile.base          shared base of all agent images
+  PADDOCK.md                  sandbox notes for the agent, built into the base image
+  AGENTS.md                   default AGENTS.md written into workspaces
   tools/<tool>/
     tool.conf                 command, yolo_args, npm_package
     Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
@@ -141,8 +143,29 @@ source.
 
 `config` settings (empty value disables a limit): `agent_memory=4g`,
 `agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
-`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit and `env`
-changes take effect on `paddock recreate <name>`.
+`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts), `agents_md=yes`
+(`no`: never add `AGENTS.md` to workspaces). Limit and `env` changes take effect
+on `paddock recreate <name>`.
+
+### Agent instructions
+
+The base image contains `/etc/paddock/PADDOCK.md`. It tells the agent what the
+sandbox looks like, and that it cannot widen it itself: when the proxy blocks a
+domain or it needs a system package, it should stop and ask you, giving the
+exact `paddock domains <instance> add ...` command or the Containerfile change.
+The instance name comes from `$PADDOCK_INSTANCE`.
+
+So that agents read it, `create` and `recreate` write a short `AGENTS.md` into
+the workspace that points to that file. Claude Code and other agents read
+`AGENTS.md` automatically. paddock never overwrites an existing `AGENTS.md`;
+if your project already has one, add a reference to `/etc/paddock/PADDOCK.md`
+yourself if you want it. Skip it per instance with `create --no-agents-md` or
+for all instances with `agents_md=no` in `config`.
+
+Both files can be overridden in the config dir (`PADDOCK.md`, `AGENTS.md`). A
+changed `PADDOCK.md` takes effect after `paddock build <tool>` and
+`paddock recreate <name>`; if you override `Containerfile.base`, keep its
+`COPY PADDOCK.md` line.
 
 ### Git
 

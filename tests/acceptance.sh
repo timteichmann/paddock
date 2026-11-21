@@ -80,6 +80,7 @@ cleanup() {
   rm -f "$HOME_MARK"
   [[ -n ${CREATED_WS1-} ]] && rm -rf "$WS1"
   [[ -n ${CREATED_WS2-} ]] && rm -rf "$WS2"
+  rm -rf /tmp/pd-t3
   return "$rc"
 }
 
@@ -239,6 +240,29 @@ check "create claude t3 /tmp/pd-t1/sub (no --domains)" pd create claude t3 "$WS1
 check "start t3" pd start t3
 check "recreate t3 keeps working" bash -c "'$PADDOCK' recreate t3 && '$PADDOCK' start t3"
 check "rm t3" pd rm t3 --force
+
+section "extra: AGENTS.md and PADDOCK.md"
+WS3=/tmp/pd-t3
+rm -rf "$WS3"
+check "create claude t3 $WS3" pd create claude t3 "$WS3"
+check "AGENTS.md added to a workspace without one" grep -qF /etc/paddock/PADDOCK.md "$WS3/AGENTS.md"
+check "AGENTS.md owned by host user" test "$(stat -c %u "$WS3/AGENTS.md" 2>/dev/null)" = "$(id -u)"
+check "start t3" pd start t3
+check "PADDOCK.md readable in the agent" ax t3 grep -qF 'paddock domains' /etc/paddock/PADDOCK.md
+check "PADDOCK_INSTANCE is set in the agent" test "$(ax t3 printenv PADDOCK_INSTANCE)" = t3
+echo "project rules" >"$WS3/AGENTS.md"
+check "recreate t3" pd recreate t3
+check "recreate keeps an existing AGENTS.md" test "$(cat "$WS3/AGENTS.md")" = "project rules"
+rm -f "$WS3/AGENTS.md"
+check "recreate re-adds a missing AGENTS.md" bash -c "'$PADDOCK' recreate t3 && grep -qF /etc/paddock/PADDOCK.md '$WS3/AGENTS.md'"
+check "rm t3" pd rm t3 --force
+rm -f "$WS3/AGENTS.md"
+check "create --no-agents-md" pd create claude t3 "$WS3" --no-agents-md
+check_not "no AGENTS.md with --no-agents-md" test -e "$WS3/AGENTS.md"
+check "recreate t3" pd recreate t3
+check_not "recreate respects --no-agents-md" test -e "$WS3/AGENTS.md"
+check "rm t3" pd rm t3 --force
+rm -rf "$WS3"
 
 # --------------------------------------------------------------- summary --
 printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
