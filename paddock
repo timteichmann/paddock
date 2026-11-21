@@ -519,7 +519,9 @@ exec_env_args() {
   if [[ -f $f ]]; then printf -- '--env-file=%s\n' "$f"; fi
 }
 
-tty_flags() { if [[ -t 0 && -t 1 ]]; then printf -- '-it'; else printf -- '-i'; fi; }
+# Sets TTY_FLAG for podman exec. Not a $(...) helper: inside command
+# substitution stdout is a pipe, so [[ -t 1 ]] would always be false.
+set_tty_flag() { if [[ -t 0 && -t 1 ]]; then TTY_FLAG=-it; else TTY_FLAG=-i; fi; }
 
 # --------------------------------------------------------------- commands --
 
@@ -630,7 +632,8 @@ cmd_attach() {
     cargs=(--dangerously-skip-permissions "${cargs[@]}")
   fi
   local -a envs; mapfile -t envs < <(exec_env_args "$name")
-  exec podman exec "$(tty_flags)" -w /workspace "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
+  local TTY_FLAG; set_tty_flag
+  exec podman exec "$TTY_FLAG" -w /workspace "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
 }
 
 cmd_shell() {
@@ -638,7 +641,8 @@ cmd_shell() {
   require_instance "$1"
   start_instance "$1"
   local -a envs; mapfile -t envs < <(exec_env_args "$1")
-  exec podman exec "$(tty_flags)" -w /workspace "${envs[@]}" "$(agent_ctr "$1")" bash
+  local TTY_FLAG; set_tty_flag
+  exec podman exec "$TTY_FLAG" -w /workspace "${envs[@]}" "$(agent_ctr "$1")" bash
 }
 
 cmd_rm() {
