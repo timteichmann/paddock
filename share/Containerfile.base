@@ -12,6 +12,11 @@ RUN pacman -Syu --noconfirm --needed \
 RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
  && mkdir -p /home/agent /workspace && chmod 0777 /home/agent
 
+# Sandbox notes for the agent; the workspace AGENTS.md written by paddock
+# points here.
+COPY PADDOCK.md /etc/paddock/PADDOCK.md
+RUN chmod 0644 /etc/paddock/PADDOCK.md
+
 ENV HOME=/home/agent
 WORKDIR /workspace
 LABEL paddock.image=base
