@@ -1,0 +1,3 @@
+# Domains every paddock instance may reach, whatever its tool.
+# Tool-specific domains live in tools/<tool>/domains.txt.
+# Syntax: example.com (exact) or .example.com (domain and all subdomains).
