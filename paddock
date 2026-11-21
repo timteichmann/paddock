@@ -62,7 +62,9 @@ confirm() {
 find_data_dir() {
   local self d
   self=$(realpath -- "${BASH_SOURCE[0]}")
+  # <prefix>/bin/paddock -> <prefix>/share/paddock covers any install prefix.
   for d in ${PADDOCK_DATA_DIR:+"$PADDOCK_DATA_DIR"} "$(dirname "$self")/share" \
+           "$(dirname "$(dirname "$self")")/share/paddock" \
            "${XDG_DATA_HOME:-$HOME/.local/share}/paddock" /usr/local/share/paddock /usr/share/paddock; do
     [[ -f $d/config && -d $d/tools ]] && { printf '%s' "$d"; return 0; }
   done
@@ -888,6 +890,103 @@ cmd_tools() {
   done < <(list_tools)
 }
 
+# ----------------------------------------------------------------- doctor --
+
+# os_release KEY: value of KEY in /etc/os-release (empty if unset).
+os_release() {
+  [[ -r /etc/os-release ]] || return 0
+  # shellcheck disable=SC1091
+  (. /etc/os-release && printf '%s' "${!1-}")
+}
+
+# version_ge A B: true if dotted version A >= B.
+version_ge() { [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1) == "$2" ]]; }
+
+readonly PODMAN_MIN=4.4.0
+readonly PODMAN_DOCS=https://podman.io/docs/installation
+
+# Checks the host for what paddock needs and prints a fix for each problem.
+# Exit status 1 if anything required is missing; warnings do not fail.
+cmd_doctor() {
+  (($# == 0)) || die "usage: paddock doctor"
+  local nfail=0 nwarn=0 user v info="" backend rootless cgv ctrls c missing=""
+  ok()   { printf '  ok    %s\n' "$1"; }
+  bad()  { nfail=$((nfail + 1)); printf '  FAIL  %s\n' "$1"; shift; local l; for l; do printf '        %s\n' "$l"; done; }
+  meh()  { nwarn=$((nwarn + 1)); printf '  warn  %s\n' "$1"; shift; local l; for l; do printf '        %s\n' "$l"; done; }
+  user=$(id -un)
+
+  v=$(os_release PRETTY_NAME)
+  printf 'paddock %s on %s\n' "$PADDOCK_VERSION" "${v:-$(uname -s)}"
+
+  if ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then
+    ok "bash $BASH_VERSION"
+  else bad "bash $BASH_VERSION is older than 4.4"; fi
+
+  if ((EUID == 0)); then bad "running as root" "paddock uses rootless Podman; run it as your normal user"
+  else ok "running as $user (uid $EUID)"; fi
+
+  if DATA_DIR=$(find_data_dir 2>/dev/null); then ok "data dir $DATA_DIR"
+  else bad "data dir not found" "install with ./install.sh, or set PADDOCK_DATA_DIR"; fi
+
+  if command -v curl >/dev/null 2>&1; then ok "curl"
+  else meh "curl not found" "needed by 'paddock build' without --version; install curl"; fi
+
+  for c in newuidmap newgidmap; do command -v "$c" >/dev/null 2>&1 || missing+=" $c"; done
+  if [[ -z $missing ]]; then ok "newuidmap/newgidmap"
+  else bad "missing:$missing (needed for rootless Podman)" "install the package that provides them, see $PODMAN_DOCS"; fi
+
+  # Subordinate IDs: /etc/subuid and /etc/subgid list the user by name or uid.
+  ((EUID == 0)) || for c in subuid subgid; do
+    if grep -qsE "^($user|$EUID):" "/etc/$c"; then ok "/etc/$c has an entry for $user"
+    else bad "/etc/$c has no entry for $user" \
+      "sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $user" \
+      "then: podman system migrate"; fi
+  done
+
+  if [[ -e /dev/net/tun && ! ( -r /dev/net/tun && -w /dev/net/tun ) ]]; then
+    bad "/dev/net/tun is not accessible to $user" "rootless networking (slirp4netns/pasta) needs it; on a normal host it is mode 0666"
+  fi
+
+  if [[ -r /sys/fs/selinux/enforce && $(cat /sys/fs/selinux/enforce) == 1 ]]; then
+    local relabel
+    relabel=$( [[ -n $DATA_DIR ]] && { load_config; printf '%s' "${CFG[relabel]-}"; } 2>/dev/null )
+    if [[ -n $relabel ]]; then ok "SELinux enforcing, relabel=$relabel"
+    else meh "SELinux is enforcing but relabel is empty" \
+      "the agent cannot use the workspace; set relabel=Z in ${CONFIG_DIR/#$HOME/\~}/config"; fi
+  fi
+
+  if ! command -v podman >/dev/null 2>&1; then
+    bad "podman not found" "install Podman >= $PODMAN_MIN with netavark: $PODMAN_DOCS"
+  else
+    v=$(podman --version 2>/dev/null | awk '{print $NF}')
+    if version_ge "${v:-0}" "$PODMAN_MIN"; then ok "podman $v"
+    else bad "podman ${v:-?} is older than $PODMAN_MIN" \
+      "paddock needs netavark network isolation; use a newer distro release or Podman build"; fi
+
+    if ((EUID == 0)); then :
+    elif ! info=$(podman info --format '{{.Host.Security.Rootless}}|{{.Host.NetworkBackend}}|{{.Host.CgroupsVersion}}|{{range .Host.CgroupControllers}}{{.}} {{end}}' 2>/dev/null); then
+      bad "'podman info' failed" "run it to see why (often: missing subuid/subgid, or run 'podman system migrate')"
+    else
+      IFS='|' read -r rootless backend cgv ctrls <<<"$info"
+      if [[ $rootless == true ]]; then ok "podman is rootless"
+      else bad "podman is not rootless" "unset CONTAINER_HOST / remote connections and run as a normal user"; fi
+      if [[ $backend == netavark ]]; then ok "network backend netavark"
+      else bad "network backend is '${backend:-?}', paddock needs netavark" \
+        "install netavark and aardvark-dns, set network_backend=\"netavark\" under [network] in ~/.config/containers/containers.conf," \
+        "then 'podman system reset' (deletes all your containers and images)"; fi
+      missing=""
+      for c in memory cpu pids; do [[ " $ctrls " == *" $c "* ]] || missing+=" $c"; done
+      if [[ $cgv != v2 ]]; then meh "cgroups $cgv: memory/CPU/pids limits are ignored" "boot with cgroup v2 (systemd.unified_cgroup_hierarchy=1) to enforce them"
+      elif [[ -n $missing ]]; then meh "cgroup controllers not delegated to $user:$missing (those limits are ignored)" \
+        "see https://rootlesscontaine.rs/getting-started/common/cgroup2/"
+      else ok "cgroup v2 with memory, cpu and pids delegated"; fi
+    fi
+  fi
+
+  printf '%d problem(s), %d warning(s)\n' "$nfail" "$nwarn"
+  ((nfail == 0))
+}
+
 usage() {
   cat <<EOF
 paddock $PADDOCK_VERSION - isolated coding-agent instances on rootless Podman
@@ -907,6 +1006,7 @@ Usage: paddock <command> [args]
   logs <name> [-f] [-n N] [--raw]                     proxy log of allowed/denied requests
   build <tool> [--version X]                          build proxy, base and tool images
   tools                                               list available tools
+  doctor                                              check that this host can run paddock
 
 Tools:   $( [[ -n $DATA_DIR ]] && list_tools | paste -sd' ')
 Config:  $CONFIG_DIR (a file here overrides the data dir file at the same path)
@@ -920,6 +1020,7 @@ main() {
   case $cmd in
     help|-h|--help) DATA_DIR=$(find_data_dir 2>/dev/null) || DATA_DIR=""; usage; return 0 ;;
     version|--version) echo "paddock $PADDOCK_VERSION"; return 0 ;;
+    doctor) cmd_doctor "$@"; return ;;
   esac
   ((EUID != 0)) || die "run paddock as a normal user, not root"
   need_cmd podman
