@@ -6,8 +6,10 @@
 #
 #   tests/distro.sh                 ubuntu and arch
 #   tests/distro.sh ubuntu debian arch fedora
+#   tests/distro.sh arch-pkg        build, install and remove the Arch package
 #
-# Distros: ubuntu (24.04), debian (13), arch, fedora. Works with podman or
+# Distros: ubuntu (24.04), debian (13), arch, fedora; arch-pkg runs
+# tests/arch-package-test.sh instead of the install test. Works with podman or
 # docker, as root or rootless; no paddock instances are created.
 #
 # Environment overrides:
@@ -27,7 +29,7 @@ image() {
   case $1 in
     ubuntu) echo docker.io/library/ubuntu:24.04 ;;
     debian) echo docker.io/library/debian:13 ;;
-    arch)   echo docker.io/library/archlinux:latest ;;
+    arch|arch-pkg) echo docker.io/library/archlinux:latest ;;
     fedora) echo registry.fedoraproject.org/fedora:latest ;;
     *) return 1 ;;
   esac
@@ -44,9 +46,10 @@ done
 
 declare -a failed=()
 for d in "$@"; do
-  img=$(image "$d") || { echo "unknown distro '$d' (ubuntu, debian, arch, fedora)" >&2; exit 2; }
+  img=$(image "$d") || { echo "unknown distro '$d' (ubuntu, debian, arch, fedora, arch-pkg)" >&2; exit 2; }
+  test=install-test.sh; [[ $d == arch-pkg ]] && test=arch-package-test.sh
   printf '\n######## %s (%s)\n' "$d" "$img"
-  "$ENGINE" run "${args[@]}" "$img" bash /src/tests/install-test.sh || failed+=("$d")
+  "$ENGINE" run "${args[@]}" "$img" bash "/src/tests/$test" || failed+=("$d")
 done
 
 printf '\n'

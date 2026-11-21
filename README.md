@@ -31,6 +31,7 @@ Any Linux distribution with:
 
 On SELinux-enforcing hosts (e.g. Fedora), set `relabel=Z` in
 `~/.config/paddock/config`. No root and no sudo at runtime.
+On Arch Linux, the [package](#arch-linux-package) pulls in everything.
 
 `paddock doctor` checks all of this and says what is missing and how to fix it.
 
@@ -66,6 +67,21 @@ config. As a user it runs `paddock doctor` at the end. Running it again
 updates the installation, and `./install.sh --uninstall [--prefix DIR]`
 removes it. Your config, instances and Podman images are kept. For distro packages,
 `DESTDIR=$pkgdir ./install.sh --prefix /usr` stages the files.
+
+### Arch Linux package
+
+`packaging/arch/PKGBUILD` packages the checkout it sits in. It downloads
+nothing and needs no release tag, and it pulls in Podman, netavark and curl:
+
+```bash
+git clone https://github.com/timteichmann/paddock && cd paddock/packaging/arch
+makepkg -si
+```
+
+To upgrade, run `git pull` and `makepkg -si` again. The version is the script
+version plus the commit, e.g. `0.1.0.r3.gbaed21f`, so each pulled commit is an
+upgrade for pacman. Uncommitted changes in the checkout are packaged too.
+`sudo pacman -R paddock` removes it and keeps your config.
 
 paddock looks for the data directory in `$PADDOCK_DATA_DIR`, then `share/` next
 to the (symlink-resolved) script, then `<prefix>/share/paddock` for a script in
@@ -217,6 +233,7 @@ diffs and history in `/workspace`.
 ```bash
 shellcheck paddock install.sh tests/*.sh
 tests/distro.sh              # install tests in fresh ubuntu and arch containers
+tests/distro.sh arch-pkg     # build, namcap, install and remove the Arch package
 tests/acceptance.sh          # full suite on this host, after `paddock build claude`
 ```
 
@@ -227,7 +244,8 @@ packages, checks the `paddock doctor` hints before and after, and runs
 uninstall. It does not start instances, because that would need nested
 rootless Podman. Behind a proxy, pass
 `PD_ENGINE_ARGS=--network=host` and `PD_TEST_CA=/path/ca.crt` (HTTP(S)_PROXY are
-passed through).
+passed through). `arch-pkg` copies the checkout, runs `makepkg` in
+`packaging/arch`, and installs, upgrades (after a test commit) and removes the package.
 
 `tests/acceptance.sh` creates `t1`/`t2` (workspaces `/tmp/pd-t1`, `/tmp/pd-t2`), runs spec tests 1–11
 plus extra checks, and cleans up. Overrides: `PD_TEST_DENIED` (domain toggled in
