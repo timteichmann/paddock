@@ -111,7 +111,7 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <tool> <name> <path> [--domains d1,d2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses `/`, `$HOME`, parents of `$HOME`, and the paddock config dir. Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
+| `create <tool> <name> <path> [--domains d1,d2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths). Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
 | `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
@@ -206,6 +206,22 @@ changed `PADDOCK.md` takes effect after `paddock build <tool>` and
 `paddock recreate <name>`; if you override `Containerfile.base`, keep its
 `COPY PADDOCK.md` line.
 
+### Workspace paths
+
+`create` refuses a workspace that is, contains or is inside:
+
+- `/`, `$HOME` or a parent of `$HOME`
+- a hidden directory of `$HOME` (`~/.config`, `~/.local`, `~/.ssh`, ...)
+- the paddock config dir, the data dir or the directory of the `paddock`
+  script (e.g. a checkout you run `./paddock` from)
+- `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME`, `$XDG_RUNTIME_DIR` and Podman's storage
+- another instance's workspace (two instances may share the same workspace)
+
+The workspace is checked again before its containers are created or started:
+if it now resolves to a different path, e.g. because a directory in the path
+was replaced by a symlink, paddock refuses to start. Filesystems mounted below
+the workspace are not visible in the instance.
+
 ### Git
 
 The workspace is a bind mount of a host directory, so do all remote git work
@@ -213,9 +229,28 @@ The workspace is a bind mount of a host directory, so do all remote git work
 no access to GitHub or other forges; `git` in the image is for local commits,
 diffs and history in `/workspace`.
 
+git on the host runs commands configured in `.git/config` (e.g.
+`core.fsmonitor`, `core.pager`, diff and filter drivers) and `.git/hooks`. So
+that the agent cannot set these, paddock mounts `.git/config` and `.git/hooks`
+read-only in the instance if the workspace has a `.git` directory when the
+containers are created. The agent can still commit, branch, merge and rebase;
+commands that write `.git/config` (`git config`, `git remote add`, setting an
+upstream) fail inside the instance. A `.git` file (worktree, submodule) is
+mounted read-only as a whole.
+
+- If the repository is created after the instance (`git init` or `git clone`
+  inside it), run `paddock recreate <name>`; `start` and `stop` remind you.
+- `.git/commondir` makes git read config and hooks from another directory.
+  paddock cannot prevent the agent from creating it, so `start` and `stop`
+  warn when it exists.
+- Changes you make to `.git/config` on the host (e.g. `git remote add`) are
+  visible in the instance after `paddock recreate <name>`.
+- Repositories in subdirectories of the workspace are not protected.
+
 ## How isolation works
 
-- **Filesystem:** only the workspace is bind-mounted (`/workspace`). Home is a
+- **Filesystem:** only the workspace is bind-mounted (`/workspace`), with
+  `.git/config` and `.git/hooks` read-only (see [Git](#git)). Home is a
   per-instance named volume, so one instance cannot plant hooks or settings in
   another. No host sockets, no `$HOME`, no host credentials.
 - **Ownership:** `--userns=keep-id --user $UID:$GID`. Files created by the agent
@@ -267,6 +302,9 @@ test 5, default `example.com`), `PD_TEST_DOMAIN2` (default `example.org`),
   proxy will connect to it. Private and host-internal addresses are blocked.
 - Squid resolves a name once for the policy check and reuses that answer to
   connect, so DNS rebinding is limited to its ipcache behaviour.
+- The agent can change any file in the workspace. Review its changes before
+  you run them on the host: build files, scripts, tests, `.envrc`, editor
+  settings and the like run with your full permissions there.
 - Kernel and Podman escapes are out of scope; use a VM for untrusted code.
 
 ## License

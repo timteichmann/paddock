@@ -214,19 +214,58 @@ dedupe_domains() {
     }' | sort
 }
 
-# Resolve and vet a workspace path; prints absolute path.
+# True if one of the absolute paths $1 and $2 is, or contains, the other.
+paths_overlap() { [[ $1 == "$2" || $1 == "$2"/* || $2 == "$1"/* ]]; }
+
+# Resolve and vet a workspace path; prints absolute path. Extra paths the
+# workspace must not overlap can be passed after the path.
 check_workspace_path() {
-  local p=$1 home cfg
+  local p=$1 home s; shift
   home=$(realpath -m -- "$HOME")
-  cfg=$(realpath -m -- "$CONFIG_DIR")
   p=$(realpath -m -- "$p")
   if [[ $p == / ]]; then die "refusing to use / as a workspace"; fi
   if [[ $p == "$home" ]]; then die "refusing to use \$HOME ($home) as a workspace"; fi
   if [[ $home == "$p"/* ]]; then die "refusing to use $p: it is a parent of \$HOME"; fi
-  if [[ $p == "$cfg" || $p == "$cfg"/* || $cfg == "$p"/* ]]; then
-    die "refusing to use $p: it overlaps the paddock config dir ($cfg)"
-  fi
+  # Hidden directories in $HOME hold settings, keys and programs the host
+  # uses (~/.config, ~/.local, ~/.ssh, ...).
+  if [[ $p == "$home"/.* ]]; then die "refusing to use $p: it is in a hidden directory of \$HOME"; fi
+  # paddock itself, its config and data, and the user's runtime dir (sockets).
+  for s in "$CONFIG_DIR" "${DATA_DIR:-}" "$(dirname "$(realpath -- "${BASH_SOURCE[0]}")")" \
+           "${XDG_CONFIG_HOME:-}" "${XDG_DATA_HOME:-}" "${XDG_RUNTIME_DIR:-}" "$@"; do
+    [[ -n $s ]] || continue
+    s=$(realpath -m -- "$s")
+    if paths_overlap "$p" "$s"; then
+      die "refusing to use $p: it overlaps $s (paddock, its config or data, your runtime dir or Podman's storage)"
+    fi
+  done
   printf '%s' "$p"
+}
+
+# Refuse a workspace that contains, or is inside, another instance's
+# workspace: an agent could replace the inner directory with a symlink and so
+# change what the other instance mounts. The same workspace is fine.
+check_workspace_overlap() { # name ws
+  local d other ows
+  for d in "$INSTANCES_DIR"/*/; do
+    other=$(basename "$d")
+    [[ $other == "$1" ]] && continue
+    ows=$(cat "$d/workspace" 2>/dev/null) || continue
+    if [[ -n $ows && $ows != "$2" ]] && paths_overlap "$2" "$ows"; then
+      die "workspace $2 overlaps the workspace of instance '$other' ($ows); nested workspaces are not supported"
+    fi
+  done
+}
+
+# The instance's workspace, checked again before its containers are created
+# or started: it must still resolve to the path chosen at create.
+verify_workspace() { # name -> prints ws
+  local name=$1 ws real
+  ws=$(<"$(instance_dir "$name")/workspace")
+  [[ -d $ws ]] || die "workspace $ws does not exist"
+  real=$(realpath -e -- "$ws")
+  [[ $real == "$ws" ]] || die "workspace $ws now resolves to $real; to use that, remove the instance and create it again"
+  check_workspace_overlap "$name" "$ws"
+  printf '%s' "$ws"
 }
 
 # ------------------------------------------------------------------ podman --
@@ -466,13 +505,53 @@ write_agents_md() {
   fi
 }
 
+# ------------------------------------------------------------------- git --
+
+# git on the host runs commands from .git/config (core.fsmonitor, core.pager,
+# filters, ...) and .git/hooks. Prints -v arguments that mount both read-only
+# in the agent, so it can commit but not change what host git runs. .git
+# itself is mounted too: a mount point cannot be renamed or replaced, so the
+# agent cannot swap in a different .git. A .git file (worktree, submodule) is
+# mounted read-only.
+git_mount_args() { # ws
+  local ws=$1 g="$1/.git"
+  if [[ -L $g ]]; then
+    warn "$g is a symlink; it is not protected"
+  elif [[ -f $g ]]; then
+    printf -- '-v\n%s:/workspace/.git:%s\n' "$g" "$(mount_opt ro,bind)"
+  elif [[ -d $g ]]; then
+    if [[ -L $g/config || -L $g/hooks || ! -f $g/config ]]; then
+      warn "$g/config or $g/hooks is a symlink or missing; .git is not protected"
+      return 0
+    fi
+    mkdir -p -- "$g/hooks"
+    printf -- '-v\n%s:/workspace/.git:%s\n' "$g" "$(mount_opt bind)"
+    printf -- '-v\n%s:/workspace/.git/config:%s\n' "$g/config" "$(mount_opt ro,bind)"
+    printf -- '-v\n%s:/workspace/.git/hooks:%s\n' "$g/hooks" "$(mount_opt ro,bind)"
+  fi
+}
+
+# Warnings about the workspace's .git that the mounts cannot cover.
+git_warnings() { # name ws
+  local name=$1 g="$2/.git" label
+  [[ -e $g || -L $g ]] || return 0
+  label=$(podman container inspect --format '{{index .Config.Labels "paddock.git"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
+  if [[ $label != protected ]]; then
+    warn "$g is not mounted read-only in '$name' (created after the instance?); run 'paddock recreate $name' to protect it"
+  fi
+  # git reads config and hooks from the directory named in commondir.
+  if [[ -e $g/commondir ]]; then
+    warn "$g/commondir exists; git on the host reads config and hooks from the directory it names. Check it before using git there"
+  fi
+  return 0
+}
+
 # ------------------------------------------------------------- containers --
 
 create_containers() {
   local name=$1 ws ip uid gid tool envf
   tool=$(instance_tool "$name")
-  ws=$(<"$(instance_dir "$name")/workspace")
-  [[ -d $ws ]] || die "workspace $ws does not exist"
+  ws=$(verify_workspace "$name")
   ip=$(proxy_ip "$name")
   uid=$(id -u); gid=$(id -g)
   generate_proxy_config "$name"
@@ -495,8 +574,10 @@ create_containers() {
     -v "$(instance_dir "$name")/proxy:/etc/paddock:$(mount_opt ro)" \
     "$PROXY_IMAGE" >/dev/null
 
-  local -a tenv=()
+  local -a tenv=() gitv=()
   if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
+  mapfile -t gitv < <(git_mount_args "$ws")
+  ((${#gitv[@]})) && gitv+=(--label paddock.git=protected)
   local purl
   purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
   podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
@@ -507,7 +588,8 @@ create_containers() {
     --add-host "$(proxy_ctr "$name"):$ip" \
     --init \
     -v "$(home_vol "$name"):/home/agent:U" \
-    -v "$ws:/workspace$( [[ -n ${CFG[relabel]} ]] && printf ':%s' "${CFG[relabel]}")" \
+    -v "$ws:/workspace:$(mount_opt bind)" \
+    "${gitv[@]}" \
     -w /workspace \
     -e HOME=/home/agent \
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
@@ -532,8 +614,8 @@ start_instance() {
   local name=$1 pc ac
   pc=$(proxy_ctr "$name"); ac=$(agent_ctr "$name")
   { ctr_exists "$pc" && ctr_exists "$ac"; } || die "containers for '$name' are missing; run 'paddock recreate $name'"
-  local ws; ws=$(<"$(instance_dir "$name")/workspace")
-  [[ -d $ws ]] || die "workspace $ws does not exist"
+  local ws; ws=$(verify_workspace "$name")
+  git_warnings "$name" "$ws"
   if ! ctr_running "$pc"; then
     generate_proxy_config "$name"
     local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -598,11 +680,16 @@ cmd_create() {
 
   require_images "$tool"
 
+  # Podman's storage (images, containers, volumes) must not be a workspace.
+  local -a store
+  mapfile -t store < <(podman info --format '{{.Store.GraphRoot}}{{"\n"}}{{.Store.VolumePath}}' 2>/dev/null | sed '/^$/d')
   local ws
-  ws=$(check_workspace_path "$path")
+  ws=$(check_workspace_path "$path" "${store[@]}")
   [[ -e $ws && ! -d $ws ]] && die "$ws exists and is not a directory"
+  check_workspace_overlap "$name" "$ws"
   mkdir -p -- "$ws"
-  ws=$(check_workspace_path "$(realpath -e -- "$ws")")   # re-check after symlink resolution
+  ws=$(check_workspace_path "$(realpath -e -- "$ws")" "${store[@]}")   # re-check after symlink resolution
+  check_workspace_overlap "$name" "$ws"
 
   # Roll back everything on failure.
   trap 'rc=$?; if ((rc)); then warn "create failed, rolling back"; remove_podman_objects "'"$name"'"; rm -rf -- "'"$dir"'"; fi' EXIT
@@ -625,6 +712,8 @@ cmd_recreate() {
   (($# == 1)) || die "usage: paddock recreate <name>"
   local name=$1 tool; require_instance "$name"
   tool=$(instance_tool "$name"); load_tool "$tool"; require_images "$tool"
+  # Check before removing anything, so a refusal leaves the instance as it was.
+  verify_workspace "$name" >/dev/null
   local c
   for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
     ctr_exists "$c" && podman rm -f -t 5 "$c" >/dev/null
@@ -656,6 +745,7 @@ cmd_stop() {
   for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
     ctr_exists "$c" && podman stop -t 5 "$c" >/dev/null
   done
+  [[ -f $(instance_dir "$name")/workspace ]] && git_warnings "$name" "$(<"$(instance_dir "$name")/workspace")"
   info "instance '$name' stopped"
 }
 

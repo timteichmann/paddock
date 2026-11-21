@@ -106,3 +106,9 @@ Use git only for local work in `/workspace` (commit, diff, log, branch). There
 are no git credentials and forges like GitHub are normally not allowlisted, so
 fetch, pull and push are done by the user on the host. Ask them when you need
 that.
+
+`.git/config` and `.git/hooks` are read-only. Committing, branching, merging
+and rebasing work; commands that write the repository config (`git config`,
+`git remote add`, `--set-upstream`) fail. Set your identity in your home
+directory instead: `git config --global user.name ...` and
+`git config --global user.email ...`.
