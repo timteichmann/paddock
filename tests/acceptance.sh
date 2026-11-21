@@ -94,8 +94,8 @@ other_instances() {
   local keep=" $* "
   {
     ls "$(cfg_dir)/instances" 2>/dev/null
-    podman ps -a --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
-    podman volume ls --filter label=paddock.instance --format '{{index .Labels "paddock.instance"}}'
+    podman ps -a --filter label=paddock.instance --format '{{.Names}}' | sed -nE 's/^pd-(.+)-(agent|proxy)$/\1/p'
+    podman volume ls --filter label=paddock.instance --format '{{.Name}}' | sed -nE 's/^pd-(.+)-home$/\1/p'
     podman network ls --filter label=paddock.instance --format '{{.Name}}' | sed -nE 's/^pd-(.+)-(int|ext)$/\1/p'
   } | sort -u | while read -r n; do [[ -n $n && $keep != *" $n "* ]] && echo "$n"; done
 }
@@ -264,6 +264,12 @@ check_not "create refuses \$HOME" pd create claude tbad "$HOME"
 check_not "create refuses /" pd create claude tbad /
 check_not "create refuses a parent of \$HOME ($(dirname "$HOME"))" pd create claude tbad "$(dirname "$HOME")"
 check_not "create refuses the paddock config dir" pd create claude tbad "$(cfg_dir)/x"
+check_not "create refuses a hidden dir of \$HOME" pd create claude tbad "$HOME/.pd-test-$MARK"
+check_not "... and did not create it" test -e "$HOME/.pd-test-$MARK"
+check_not "create refuses the paddock script's dir" pd create claude tbad "$(dirname "$(realpath "$PADDOCK")")"
+check_not "create refuses Podman's storage" pd create claude tbad "$(podman info --format '{{.Store.GraphRoot}}')/x"
+check_not "create refuses a workspace inside $T2's ($WS2/sub)" pd create claude tbad "$WS2/sub"
+check_not "create refuses a workspace containing $T2's (/tmp)" pd create claude tbad /tmp
 check_not "create refuses an invalid name" pd create claude Bad_Name /tmp/pd-bad
 check_not "create refuses an unknown tool" pd create nosuchtool tbad /tmp/pd-bad
 check_not "no instance 'tbad' was created" test -e "$(cfg_dir)/instances/tbad"
@@ -296,6 +302,53 @@ check "recreate t3" pd recreate t3
 check_not "recreate respects --no-agents-md" test -e "$WS3/AGENTS.md"
 check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
+
+section "extra: git protection"
+WS3=/tmp/pd-t3
+rm -rf "$WS3"; mkdir -p "$WS3"
+if ! command -v git >/dev/null; then
+  skip "git protection tests: git not installed on the host"
+else
+  git -C "$WS3" init -q
+  cfg_sum=$(sha256sum <"$WS3/.git/config")
+  check "create claude t3 on a git repo" pd create claude t3 "$WS3" --no-agents-md
+  check "start t3" pd start t3
+  ax t3 git config --global user.name test >/dev/null 2>&1
+  ax t3 git config --global user.email test@example.invalid >/dev/null 2>&1
+  check "agent can commit" ax t3 sh -c 'cd /workspace && echo x > f && git add f && git commit -qm test'
+  check "agent can create and switch branches" ax t3 sh -c 'cd /workspace && git switch -qc b2 && git switch -q -'
+  check "commit visible on the host" test "$(git -C "$WS3" log --format=%s -1)" = test
+  check_not "agent cannot write .git/config" ax t3 git -C /workspace config core.fsmonitor 'touch /tmp/x'
+  check_not "agent cannot add a hook" ax t3 sh -c 'echo "#!/bin/sh" > /workspace/.git/hooks/pre-commit'
+  check_not "agent cannot replace .git/config" ax t3 sh -c 'cp /workspace/.git/config /tmp/c && mv /tmp/c /workspace/.git/config'
+  check_not "agent cannot move .git aside" ax t3 mv /workspace/.git /workspace/.git-old
+  check_not "agent cannot move hooks aside" ax t3 mv /workspace/.git/hooks /workspace/.git/hooks-old
+  check ".git/config unchanged on the host" test "$(sha256sum <"$WS3/.git/config")" = "$cfg_sum"
+  check_not "no hooks on the host" test -e "$WS3/.git/hooks/pre-commit"
+  ax t3 touch /workspace/.git/commondir
+  check "stop warns about .git/commondir" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q commondir"
+  rm -f "$WS3/.git/commondir"
+  check "rm t3" pd rm t3 --force
+  rm -rf "$WS3/.git"
+  check "create claude t3 without a repo" pd create claude t3 "$WS3" --no-agents-md
+  check "start t3" pd start t3
+  ax t3 git -C /workspace init -q >/dev/null 2>&1
+  check "start warns about an unprotected .git" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only'"
+  check "recreate protects it" bash -c "'$PADDOCK' recreate t3 >/dev/null 2>&1 && ! '$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only' && ! podman exec pd-t3-agent touch /workspace/.git/hooks/x"
+  check "rm t3" pd rm t3 --force
+fi
+rm -rf "$WS3"
+
+section "extra: workspace path changes"
+mkdir -p /tmp/pd-t3/ws
+check "create claude t3 /tmp/pd-t3/ws" pd create claude t3 /tmp/pd-t3/ws --no-agents-md
+mv /tmp/pd-t3/ws /tmp/pd-t3/ws2 && ln -s ws2 /tmp/pd-t3/ws
+check_not "start refuses a workspace that now resolves elsewhere" pd start t3
+check_not "recreate refuses it too" pd recreate t3
+rm /tmp/pd-t3/ws && mv /tmp/pd-t3/ws2 /tmp/pd-t3/ws
+check "start works again with the original directory" pd start t3
+check "rm t3" pd rm t3 --force
+rm -rf /tmp/pd-t3
 
 section "extra: purge"
 # purge removes *all* instances of this user, so it only runs when no
