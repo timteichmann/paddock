@@ -1,0 +1,44 @@
+# Maintainer: Tim Teichmann <teichmann.dev@mailbox.org>
+# Copyright (C) 2026 Tim Teichmann
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Local package: builds the paddock checkout this file sits in (no download,
+# no release tag needed). From a clone:
+#
+#   cd packaging/arch && makepkg -si
+#
+# After a `git pull`, run it again to upgrade. Uncommitted changes in the
+# checkout are packaged too. Before `pacman -R paddock`, run `paddock purge`
+# as each user to remove their instances, images and config.
+
+pkgname=paddock
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Isolated coding-agent instances on rootless Podman, with a per-instance domain allowlist'
+arch=('any')
+url='https://github.com/timteichmann/paddock'
+license=('GPL-2.0-or-later')
+depends=('bash' 'coreutils' 'curl' 'findutils' 'gawk' 'grep' 'netavark' 'podman>=4.4' 'sed' 'shadow')
+makedepends=('git')
+install=paddock.install
+
+# makepkg's $srcdir is packaging/arch/src inside the checkout.
+_repo() { realpath "$srcdir/../../.."; }
+
+# <script version>.r<commits>.g<hash>, e.g. 0.1.0.r3.gbaed21f, so every
+# pulled commit is an upgrade for pacman.
+pkgver() {
+  cd "$(_repo)"
+  local v
+  v=$(./paddock version | awk '{print $2}' | tr - _)
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+  else
+    printf '%s' "$v"
+  fi
+}
+
+package() {
+  cd "$(_repo)"
+  DESTDIR="$pkgdir" ./install.sh --prefix /usr
+}

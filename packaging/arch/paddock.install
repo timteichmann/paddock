@@ -1,0 +1,18 @@
+# pacman never touches home directories, so each user's paddock state
+# (instances, images, ~/.config/paddock) stays unless they run `paddock purge`.
+
+post_install() {
+  echo "paddock: run 'paddock doctor' as your user to check the host."
+  echo "paddock: before 'pacman -R paddock', run 'paddock purge' as each user"
+  echo "         to remove their instances, images and config."
+}
+
+post_remove() {
+  echo "paddock: users' instances, images and ~/.config/paddock were kept."
+  echo "         If you did not run 'paddock purge' first, clean up as each user with:"
+  echo "         podman rm -f \$(podman ps -aq --filter label=paddock.instance)"
+  echo "         podman volume rm \$(podman volume ls -q --filter label=paddock.instance)"
+  echo "         podman network rm \$(podman network ls -q --filter label=paddock.instance)"
+  echo "         podman rmi \$(podman images --format '{{.Repository}}:{{.Tag}}' | grep ^localhost/paddock-)"
+  echo "         rm -rf ~/.config/paddock"
+}
