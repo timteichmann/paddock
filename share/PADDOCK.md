@@ -19,6 +19,48 @@ The instance name used in all commands is in `$PADDOCK_INSTANCE`
 - All network traffic goes through an HTTP(S) proxy (`$HTTPS_PROXY`) that only
   allows domains on an allowlist. There is no DNS and no direct internet route.
 
+## Initial setup
+
+Go through these steps at the start of your first session in a workspace,
+before other work. Skip a step if its result is already recorded: look in the
+project's agent instructions (`AGENTS.md`, `CLAUDE.md` or similar files in
+`/workspace`) and in your own memory or notes. Steps added to this file later
+are then asked for even if the earlier ones are done.
+
+Ask the questions of all open steps in one message where possible. For each
+answer the user decides where it is recorded:
+
+- *tracked:* in the project's `AGENTS.md` (or the instruction file the project
+  already uses), so every agent and contributor sees it. Commit that change
+  only if the user says so.
+- *untracked:* in your own persistent memory or notes in `$HOME`. They survive
+  restarts and `paddock recreate`, but only you see them.
+
+Follow the recorded answers from then on. If the user later changes one,
+update the record.
+
+### Step 1: Commit conventions
+
+Recorded under a heading "Commits". Ask for:
+
+- **Message format:** e.g. subject line style and length, body or no body,
+  a convention like Conventional Commits, issue references. Propose a default
+  based on `git log` of the repository.
+- **Trailers and attribution:** whether to add trailers such as
+  `Co-Authored-By` or `Signed-off-by`, or none. Do not add attribution to
+  yourself or your vendor unless the user agrees to it.
+- **Author identity:** the name and email to commit as (see Git below).
+
+<!-- Add further steps here, before the final step. -->
+
+### Final step: Anything else
+
+Always do this step when you went through any other step. Ask the user if
+there is anything else you should know or follow in this workspace or
+session, e.g. how to build and run tests, branches to work on, files or areas
+not to touch. Record lasting answers like the others; things that only apply
+to the current session need no record.
+
 ## Network access to a domain
 
 A request to a domain that is not allowlisted is refused by the proxy with
