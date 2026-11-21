@@ -375,8 +375,6 @@ htcp_port 0
 
 pid_filename /tmp/squid.pid
 coredump_dir /tmp
-netdb_filename none
-pinger_enable off
 cache deny all
 cache_mem 8 MB
 via off
@@ -396,10 +394,12 @@ acl port_https port 443
 acl port_http port 80
 acl proto_http proto HTTP
 # Loopback, "this network", RFC 1918, CGNAT, link-local, IETF/test/benchmark
-# ranges, multicast/reserved; IPv6 loopback/unspecified, v4-mapped, NAT64,
-# ULA, link-local, documentation, multicast.
+# ranges, multicast/reserved; IPv6 loopback/unspecified, NAT64, ULA, link-local,
+# documentation, multicast. No ::ffff:0:0/96: with IPv6 on, Squid stores IPv4
+# addresses v4-mapped, so that entry equals 0.0.0.0/0 and would deny every IPv4
+# destination. Mapped addresses are matched by the IPv4 entries instead.
 acl forbidden_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4
-acl forbidden_dst dst ::/128 ::1/128 ::ffff:0:0/96 64:ff9b::/96 64:ff9b:1::/48 fc00::/7 fe80::/10 fec0::/10 2001:db8::/32 ff00::/8
+acl forbidden_dst dst ::/128 ::1/128 64:ff9b::/96 64:ff9b:1::/48 fc00::/7 fe80::/10 fec0::/10 2001:db8::/32 ff00::/8
 
 http_access deny !agent_net
 http_access deny !allowlist
