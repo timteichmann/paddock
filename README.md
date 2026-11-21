@@ -72,6 +72,12 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
 | `build [--version X]` | without `--version`, the latest npm version is resolved and pinned |
 
+`attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the
+instance, so Claude Code shows full colors. If the agent image has no terminfo
+for your `TERM`, `xterm-256color` is used instead. Over SSH, `COLORTERM` is
+usually not forwarded; set `COLORTERM=truecolor` on the host if your terminal
+supports it.
+
 Domain syntax: `example.com` (exact) or `.example.com` (domain and subdomains).
 IPs, URLs, ports, `*` globs and bare TLDs are rejected. Overlapping entries
 (e.g. `example.com` and `.example.com`) are merged automatically because Squid

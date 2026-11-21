@@ -528,6 +528,21 @@ exec_env_args() {
 # substitution stdout is a pipe, so [[ -t 1 ]] would always be false.
 set_tty_flag() { if [[ -t 0 && -t 1 ]]; then TTY_FLAG=-it; else TTY_FLAG=-i; fi; }
 
+# Prints -e args that pass the host terminal's TERM and COLORTERM to an
+# interactive exec session. Without them the session gets podman's default
+# TERM=xterm and no COLORTERM, and Claude Code drops to 16 colors (its orange
+# turns red). A TERM the agent image has no terminfo for is replaced by
+# xterm-256color, since bash and less misbehave with an unknown TERM.
+term_env_args() {
+  local ctr=$1 term=${TERM-} colorterm=${COLORTERM-}
+  [[ $TTY_FLAG == -it ]] || return 0
+  if [[ $term =~ ^[A-Za-z0-9._+-]+$ && $term != dumb ]]; then
+    podman exec "$ctr" infocmp -- "$term" >/dev/null 2>&1 || term=xterm-256color
+    printf -- '-e\nTERM=%s\n' "$term"
+  fi
+  if [[ $colorterm =~ ^[A-Za-z0-9._+-]+$ ]]; then printf -- '-e\nCOLORTERM=%s\n' "$colorterm"; fi
+}
+
 # --------------------------------------------------------------- commands --
 
 cmd_create() {
@@ -638,7 +653,8 @@ cmd_attach() {
   fi
   local -a envs; mapfile -t envs < <(exec_env_args "$name")
   local TTY_FLAG; set_tty_flag
-  exec podman exec "$TTY_FLAG" -w /workspace "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
+  local -a tenvs; mapfile -t tenvs < <(term_env_args "$(agent_ctr "$name")")
+  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "${envs[@]}" "$(agent_ctr "$name")" claude "${cargs[@]}"
 }
 
 cmd_shell() {
@@ -647,7 +663,8 @@ cmd_shell() {
   start_instance "$1"
   local -a envs; mapfile -t envs < <(exec_env_args "$1")
   local TTY_FLAG; set_tty_flag
-  exec podman exec "$TTY_FLAG" -w /workspace "${envs[@]}" "$(agent_ctr "$1")" bash
+  local -a tenvs; mapfile -t tenvs < <(term_env_args "$(agent_ctr "$1")")
+  exec podman exec "$TTY_FLAG" -w /workspace "${tenvs[@]}" "${envs[@]}" "$(agent_ctr "$1")" bash
 }
 
 cmd_rm() {
