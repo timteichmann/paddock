@@ -102,7 +102,7 @@ check "podman is rootless" test "$(podman info --format '{{.Host.Security.Rootle
 check_not "paddock never invokes sudo" bash -c "grep -vE '^[[:space:]]*#' '$PADDOCK' | grep -qE '(^|[^a-z_])sudo[[:space:]]'"
 
 section "1. create + start + list"
-check "create $T1 $WS1 --domains pypi.org" pd create "$T1" "$WS1" --domains pypi.org
+check "create claude $T1 $WS1 --domains pypi.org" pd create claude "$T1" "$WS1" --domains pypi.org
 check "start $T1" pd start "$T1"
 check "start is idempotent" pd start "$T1"
 check "list shows $T1 running" bash -c "'$PADDOCK' list | awk '\$1==\"$T1\" {print \$2}' | grep -qx running"
@@ -184,6 +184,10 @@ check_not "no socket files anywhere (podman/ssh-agent/dbus/X11/wayland)" \
   bash -c "podman exec pd-$T1-agent find / \\( -path /proc -o -path /sys \\) -prune -o -type s -print 2>/dev/null | grep -q ."
 check_not "no session/socket env vars (SSH_AUTH_SOCK, DBUS, DISPLAY, ...)" \
   bash -c "podman exec pd-$T1-agent env | grep -qE '^(SSH_AUTH_SOCK|DBUS_SESSION_BUS_ADDRESS|WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR)='"
+check "agent has the tool's env (tools/claude/env)" \
+  bash -c "podman exec pd-$T1-agent env | grep -qx DISABLE_AUTOUPDATER=1"
+check "domains list shows the tool's domains" \
+  bash -c "'$PADDOCK' domains $T1 list | grep -qE '^tool +api\\.anthropic\\.com$'"
 check_not "no git credentials or forge URL rewrites in the agent" \
   bash -c "podman exec pd-$T1-agent git config --show-origin --list 2>/dev/null | grep -qiE 'credential|insteadof'"
 check_not "paddock config dir not mounted" \
@@ -192,7 +196,7 @@ check "workspace is the only host directory bind-mounted" \
   bash -c "podman inspect --format '{{range .Mounts}}{{.Type}}={{.Source}}{{\"\\n\"}}{{end}}' pd-$T1-agent | grep '^bind=' | grep -vxF 'bind=$WS1' | grep -vE '^bind=.*/(userdata|containers/storage)/' | grep -q . && exit 1 || exit 0"
 
 section "8. two concurrent instances"
-check "create $T2 $WS2 --domains $DOMAIN2" pd create "$T2" "$WS2" --domains "$DOMAIN2"
+check "create claude $T2 $WS2 --domains $DOMAIN2" pd create claude "$T2" "$WS2" --domains "$DOMAIN2"
 check "start $T2" pd start "$T2"
 echo t2-secret >"$WS2/$MARK-t2"
 echo t1-secret >"$WS1/$MARK-t1"
@@ -222,15 +226,16 @@ check "$WS1 still exists with its files" test -f "$WS1/from-agent" -a -f "$WS1/f
 check "$T2 unaffected" bash -c "'$PADDOCK' list | awk '\$1==\"$T2\" {print \$2}' | grep -qx running"
 
 section "10. dangerous workspace paths refused"
-check_not "create refuses \$HOME" pd create tbad "$HOME"
-check_not "create refuses /" pd create tbad /
-check_not "create refuses a parent of \$HOME ($(dirname "$HOME"))" pd create tbad "$(dirname "$HOME")"
-check_not "create refuses the paddock config dir" pd create tbad "$(cfg_dir)/x"
-check_not "create refuses an invalid name" pd create Bad_Name /tmp/pd-bad
+check_not "create refuses \$HOME" pd create claude tbad "$HOME"
+check_not "create refuses /" pd create claude tbad /
+check_not "create refuses a parent of \$HOME ($(dirname "$HOME"))" pd create claude tbad "$(dirname "$HOME")"
+check_not "create refuses the paddock config dir" pd create claude tbad "$(cfg_dir)/x"
+check_not "create refuses an invalid name" pd create claude Bad_Name /tmp/pd-bad
+check_not "create refuses an unknown tool" pd create nosuchtool tbad /tmp/pd-bad
 check_not "no instance 'tbad' was created" test -e "$(cfg_dir)/instances/tbad"
 
 section "extra: create without --domains, recreate"
-check "create t3 /tmp/pd-t1/sub (no --domains)" pd create t3 "$WS1/sub"
+check "create claude t3 /tmp/pd-t1/sub (no --domains)" pd create claude t3 "$WS1/sub"
 check "start t3" pd start t3
 check "recreate t3 keeps working" bash -c "'$PADDOCK' recreate t3 && '$PADDOCK' start t3"
 check "rm t3" pd rm t3 --force

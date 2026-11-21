@@ -1,0 +1,7 @@
+# paddock proxy image: Squid only. Config is mounted per instance at runtime.
+ARG BASE_IMAGE=docker.io/library/archlinux:latest
+FROM ${BASE_IMAGE}
+RUN pacman -Syu --noconfirm --needed squid \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+LABEL paddock.image=proxy
+CMD ["squid", "-N", "-f", "/etc/paddock/squid.conf"]
