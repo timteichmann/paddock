@@ -988,8 +988,9 @@ all_instance_names() {
   local d
   for d in "$INSTANCES_DIR"/*/; do basename "$d"; done
   {
-    podman ps -a --filter "label=$LABEL_KEY" --format "{{index .Labels \"$LABEL_KEY\"}}"
-    podman volume ls --filter "label=$LABEL_KEY" --format "{{index .Labels \"$LABEL_KEY\"}}"
+    # Names, not label values: some podman versions cannot index .Labels here.
+    podman ps -a --filter "label=$LABEL_KEY" --format '{{.Names}}' | sed -nE 's/^pd-(.+)-(agent|proxy)$/\1/p'
+    podman volume ls --filter "label=$LABEL_KEY" --format '{{.Name}}' | sed -nE 's/^pd-(.+)-home$/\1/p'
     # Network labels cannot be indexed in every podman version; use the name.
     podman network ls --filter "label=$LABEL_KEY" --format '{{.Name}}' | sed -nE 's/^pd-(.+)-(int|ext)$/\1/p'
   } 2>/dev/null
