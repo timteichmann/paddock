@@ -103,7 +103,9 @@ complete_as_user() { # words... -> COMPREPLY
     COMP_WORDS=($*); COMP_CWORD=\$((\${#COMP_WORDS[@]} - 1)); _paddock; echo \"\${COMPREPLY[*]}\""
 }
 check "completion: paddock cr -> create" test "$(complete_as_user paddock cr)" = create
-check "completion: paddock build '' -> claude" test "$(complete_as_user paddock build "''")" = claude
+check "completion: paddock build '' -> claude codex-local llm" \
+  test "$(complete_as_user paddock build "''")" = "claude codex-local llm"
+check "completion: paddock llm st -> start status stop" test "$(complete_as_user paddock llm st)" = "start stop status"
 check "completion: paddock purge --k -> --keep-images" \
   test "$(complete_as_user paddock purge --k)" = --keep-images
 check_not "completion does not create the config dir" test -e "/home/$U/.config/paddock"

@@ -6,6 +6,8 @@
 # Each instance = one agent container (internal network only, no route out)
 # + one Squid proxy container (internal + external network) that enforces a
 # per-instance domain allowlist. The agent can see exactly one host directory.
+# Tools with service=llm also reach one shared llama-server container that
+# joins only their internal networks.
 #
 # See README.md for the design; `paddock help` for usage.
 
@@ -21,6 +23,14 @@ readonly PROXY_IMAGE="localhost/paddock-proxy:latest"
 readonly BASE_IMAGE="localhost/paddock-base:latest"
 readonly AGENT_IMAGE_PREFIX="localhost/paddock-"   # + <tool>:<version>
 readonly INST_IMAGE_REPO="localhost/paddock-inst"  # + :<instance>, tool image + packages.txt
+# Shared local model server for tools with service=llm (see "model server").
+readonly LLM_CTR="paddock-llm"                     # container and host name
+readonly LLM_NET="paddock-llm-net"                 # its own network; nothing else joins it
+readonly LLM_PORT=8080
+readonly LLM_IMAGE_REPO="localhost/paddock-llm"    # + :<llama.cpp tag>-<backend>
+readonly LLM_LABEL="paddock.llm"
+readonly LLAMA_TAG_RE='^b[0-9]+$'
+readonly MODEL_FILE_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*\.gguf$'
 DATA_DIR=""
 readonly NAME_RE='^[a-z0-9][a-z0-9-]{0,30}$'
 # exact:  label(.label)+      wildcard: .label(.label)+
@@ -108,9 +118,16 @@ load_config() {
   [[ ${CFG[relabel]-} =~ ^[zZ]?$ ]] || die "config: relabel must be empty, 'z' or 'Z'"
   [[ ${CFG[agents_md]-} =~ ^(yes|no)$ ]] || die "config: agents_md must be 'yes' or 'no'"
   local k
-  for k in agent_pids_limit proxy_pids_limit; do
+  for k in agent_pids_limit proxy_pids_limit llm_pids_limit; do
     [[ ${CFG[$k]-} =~ ^[0-9]*$ ]] || die "config: $k must be a number or empty"
   done
+  [[ ${CFG[llm_backend]-} =~ ^(cpu|vulkan|cuda|rocm)$ ]] || die "config: llm_backend must be cpu, vulkan, cuda or rocm"
+  [[ -z ${CFG[llm_model]-} || ${CFG[llm_model]} =~ $MODEL_FILE_RE ]] \
+    || die "config: llm_model must be a .gguf file name in the models dir, e.g. Inkling-2-Mini-UD-Q4_K_XL.gguf"
+  [[ ${CFG[llm_ctx]-} =~ ^[1-9][0-9]{3,7}$ ]] || die "config: llm_ctx must be a number of tokens, e.g. 65536"
+  [[ ${CFG[llm_devices]-} =~ ^(auto|[A-Za-z0-9/._:=-]+(,[A-Za-z0-9/._:=-]+)*)?$ ]] \
+    || die "config: llm_devices must be auto, empty or a comma-separated list of devices"
+  [[ -z ${CFG[llm_models_dir]-} || ${CFG[llm_models_dir]} == /* ]] || die "config: llm_models_dir must be an absolute path"
 }
 
 init_config_dir() {
@@ -147,13 +164,30 @@ list_tools() {
 declare -A TOOL=()
 load_tool() {
   local t=$1 f
-  [[ $t =~ $NAME_RE && $t != base && $t != proxy && $t != inst ]] || die "invalid tool name '$t'"
+  [[ $t =~ $NAME_RE && $t != base && $t != proxy && $t != inst && $t != llm ]] || die "invalid tool name '$t'"
   f=$(data_file "tools/$t/tool.conf") \
     || die "unknown tool '$t' (available: $(list_tools | paste -sd' '))"
-  TOOL=([command]="" [yolo_args]="" [npm_package]="")
+  TOOL=([command]="" [yolo_args]="" [npm_package]="" [service]="" [config_template]="" [config_path]="")
   parse_kv "$f" TOOL
   [[ -n ${TOOL[command]} ]] || die "$f: command is required"
+  [[ ${TOOL[service]} =~ ^(llm)?$ ]] || die "$f: service must be empty or 'llm'"
+  if [[ -n ${TOOL[config_template]} || -n ${TOOL[config_path]} ]]; then
+    [[ ${TOOL[config_template]} =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "$f: config_template must be a file name in the tool's directory"
+    data_file "tools/$t/${TOOL[config_template]}" >/dev/null || die "$f: tools/$t/${TOOL[config_template]} not found"
+    # The file's directory is mounted from the host; keep it to a dedicated one.
+    [[ ${TOOL[config_path]} =~ ^/etc/[a-z0-9][a-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+      || die "$f: config_path must be a file in a directory of its own under /etc, e.g. /etc/codex/config.toml"
+  fi
   TOOL[name]=$t
+}
+
+# Service ("" or llm) of tool $1, without loading it into TOOL.
+tool_service() {
+  local f
+  local -A _tc=([command]="" [yolo_args]="" [npm_package]="" [service]="" [config_template]="" [config_path]="")
+  f=$(data_file "tools/$1/tool.conf") || return 0
+  parse_kv "$f" _tc
+  printf '%s' "${_tc[service]}"
 }
 
 # --------------------------------------------------------------- validate --
@@ -425,8 +459,9 @@ int_subnet() {
   die "network $(int_net "$1") has no IPv4 subnet"
 }
 
-# Static proxy address on the internal network: last usable host address.
-proxy_ip() {
+# Static addresses on the internal network, counted down from the top so they
+# never meet the agent's address, which podman assigns from the bottom.
+subnet_top_ip() { # name n -> n-th usable host address from the top (1 = last)
   local cidr base prefix mask net bcast
   cidr=$(int_subnet "$1")
   base=${cidr%/*}; prefix=${cidr#*/}
@@ -434,8 +469,11 @@ proxy_ip() {
   mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
   net=$(( $(ip2int "$base") & mask ))
   bcast=$(( net | (~mask & 0xFFFFFFFF) ))
-  int2ip $(( bcast - 1 ))
+  int2ip $(( bcast - $2 ))
 }
+proxy_ip() { subnet_top_ip "$1" 1; }
+# The model server's address on the internal network of a local-model instance.
+llm_ip()   { subnet_top_ip "$1" 2; }
 
 limit_args() { # prefix -> podman resource flags
   local p=$1
@@ -464,6 +502,9 @@ remove_podman_objects() {
   ids=$(podman volume ls -q --filter "label=$LABEL_KEY=$name" 2>/dev/null || true)
   # shellcheck disable=SC2086
   [[ -n $ids ]] && podman volume rm -f $ids >/dev/null
+  # `network rm -f` also removes the containers on the network: detach the
+  # shared model server first.
+  llm_disconnect "$name"
   ids=$(podman network ls -q --filter "label=$LABEL_KEY=$name" 2>/dev/null || true)
   # shellcheck disable=SC2086
   [[ -n $ids ]] && podman network rm -f $ids >/dev/null
@@ -538,6 +579,9 @@ access_log stdio:/dev/stdout paddock
 cache_log /dev/stderr
 
 acl agent_net src $subnet
+# The shared model server sits in the subnet of local-model instances; it
+# never needs the proxy.
+acl llm_src src $(llm_ip "$name")
 acl allowlist dstdomain -n "/etc/paddock/allowlist.txt"
 acl CONNECT method CONNECT
 acl port_https port 443
@@ -552,6 +596,7 @@ acl forbidden_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0
 acl forbidden_dst dst ::/128 ::1/128 64:ff9b::/96 64:ff9b:1::/48 fc00::/7 fe80::/10 fec0::/10 2001:db8::/32 ff00::/8
 
 http_access deny !agent_net
+http_access deny llm_src
 http_access deny !allowlist
 http_access deny CONNECT !port_https
 http_access deny !CONNECT !port_http
@@ -592,6 +637,181 @@ wait_proxy_ready() {
   done
   podman logs --tail 20 "$pc" >&2 || true
   die "proxy $pc did not become ready"
+}
+
+# ----------------------------------------------------------- model server --
+
+# One llama-server container (paddock-llm) serves every instance whose tool
+# has service=llm. It has no route out: its own network $LLM_NET is internal,
+# and it joins the internal network of each local-model instance at a fixed
+# address (llm_ip), and no other instance's. Agents reach it directly, not
+# through their proxy. The model file is mounted read-only; nothing is
+# downloaded at runtime.
+
+# Directory of downloaded models (outside the data dir, which installs replace).
+llm_models_dir() {
+  if [[ -n ${CFG[llm_models_dir]-} ]]; then printf '%s' "${CFG[llm_models_dir]}"
+  else printf '%s/paddock/models' "${XDG_CACHE_HOME:-$HOME/.cache}"; fi
+}
+
+# Model name the server reports and tools ask for: the file name without .gguf.
+llm_alias() {
+  local m=${CFG[llm_model]-}
+  [[ -n $m ]] || { printf 'local'; return 0; }
+  printf '%s' "${m%.gguf}"
+}
+
+llm_image() {
+  local v; v=$(tool_version llm)
+  [[ -n $v ]] || die "no model server image built yet; run 'paddock build llm'"
+  printf '%s:%s' "$LLM_IMAGE_REPO" "$v"
+}
+
+# Instances whose tool uses the model server.
+llm_instances() {
+  local d n t
+  for d in "$INSTANCES_DIR"/*/; do
+    n=$(basename "$d")
+    [[ $n =~ $NAME_RE ]] || continue
+    t=$(cat "$d/tool" 2>/dev/null) || continue
+    [[ $t =~ $NAME_RE ]] || continue
+    if [[ $(tool_service "$t") == llm ]]; then printf '%s\n' "$n"; fi
+  done
+}
+
+# Internal networks the model server is attached to (besides its own).
+llm_networks() {
+  podman container inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' \
+    "$LLM_CTR" 2>/dev/null | grep -vxF "$LLM_NET" | sed '/^$/d' || true
+}
+
+# Attach the model server to instance $1's internal network, if both exist.
+llm_connect() {
+  local name=$1 net out
+  net=$(int_net "$name")
+  ctr_exists "$LLM_CTR" || return 0
+  podman network exists "$net" || return 0
+  llm_networks | grep -qxF "$net" && return 0
+  if ! out=$(podman network connect --ip "$(llm_ip "$name")" "$net" "$LLM_CTR" 2>&1); then
+    grep -qi 'already connected' <<<"$out" || die "could not attach $LLM_CTR to $net: $out"
+  fi
+}
+
+# Detach the model server from instance $1's internal network. Needed before
+# that network is removed: `podman network rm -f` removes the containers on
+# it, the model server included. Errors (e.g. not attached) are ignored.
+llm_disconnect() {
+  ctr_exists "$LLM_CTR" || return 0
+  podman network disconnect -f "$(int_net "$1")" "$LLM_CTR" >/dev/null 2>&1 || true
+}
+
+# podman --device flags for llm_devices (auto: by llm_backend).
+llm_device_args() {
+  local d=${CFG[llm_devices]} x
+  local -a xs
+  if [[ $d == auto ]]; then
+    case ${CFG[llm_backend]} in
+      cpu)    d="" ;;
+      vulkan) d=/dev/dri ;;
+      rocm)   d=/dev/kfd,/dev/dri ;;
+      cuda)   d=nvidia.com/gpu=all ;;   # CDI, see `paddock doctor`
+    esac
+  fi
+  [[ -n $d ]] || return 0
+  IFS=, read -r -a xs <<<"$d"
+  for x in "${xs[@]}"; do printf -- '--device=%s\n' "$x"; done
+  # GPU device nodes belong to groups such as render or video; keep the
+  # user's supplementary groups so the server can open them.
+  printf -- '--group-add=keep-groups\n'
+}
+
+# podman create arguments for the model server into the array named $1.
+# Dies if the image or the model file is missing.
+llm_create_args() {
+  local -n _args=$1
+  local img dir model
+  img=$(llm_image)
+  podman image exists "$img" || die "model server image $img not found; run 'paddock build llm'"
+  model=${CFG[llm_model]}
+  [[ -n $model ]] || die "no model configured: download one with 'paddock llm pull <repo> <file>', then set llm_model=<file>.gguf in $CONFIG_DIR/config"
+  dir=$(llm_models_dir)
+  [[ -f $dir/$model ]] || die "model $dir/$model not found; download it with 'paddock llm pull <repo> <file>'"
+  local -a extra lim dev
+  read -r -a extra <<<"${CFG[llm_args]-}"   # split on whitespace, no globbing
+  mapfile -t lim < <(limit_args llm)
+  mapfile -t dev < <(llm_device_args)
+  # Only the inference API: no web UI, no /slots (it shows other clients'
+  # prompts), no /props writes, no built-in tools or MCP (all off by default).
+  _args=(
+    --name "$LLM_CTR" --hostname "$LLM_CTR" --label "$LLM_LABEL=server"
+    --userns=keep-id --user "$(id -u):$(id -g)"
+    --cap-drop=ALL --security-opt=no-new-privileges
+    "${lim[@]}" "${dev[@]}"
+    --network "$LLM_NET" --dns=none
+    # It is on several instances' networks: never route between them. A new
+    # network namespace can inherit forwarding from the host, so set it.
+    --sysctl net.ipv4.ip_forward=0
+    --read-only --tmpfs "/tmp:rw,mode=1777,size=64m"
+    -v "$dir/$model:/models/$model:$(mount_opt ro)"
+    "$img"
+    llama-server --host 0.0.0.0 --port "$LLM_PORT"
+    --model "/models/$model" --alias "$(llm_alias)" --ctx-size "${CFG[llm_ctx]}"
+    --jinja --no-webui --no-slots
+    "${extra[@]}"
+  )
+}
+
+# Hash of what the model server was created from: arguments, image, model file.
+llm_hash() { # create args...
+  { printf '%s\n' "$@"
+    podman image inspect --format '{{.Id}}' "$(llm_image)"
+    stat -c '%s %Y' "$(llm_models_dir)/${CFG[llm_model]}"
+  } | sha256sum | cut -d' ' -f1
+}
+
+# Create the model server if needed (again if its settings changed while it
+# was stopped), attach it to all local-model instances and start it.
+llm_start() {
+  local -a args
+  local hash n
+  llm_create_args args
+  hash=$(llm_hash "${args[@]}")
+  if ctr_exists "$LLM_CTR" \
+     && [[ $(podman container inspect --format '{{index .Config.Labels "paddock.llm-hash"}}' "$LLM_CTR") != "$hash" ]]; then
+    if ctr_running "$LLM_CTR"; then
+      warn "$LLM_CTR runs with earlier settings, image or model; 'paddock llm restart' applies them (interrupts local-model sessions)"
+    else
+      podman rm -f "$LLM_CTR" >/dev/null
+    fi
+  fi
+  if ! ctr_exists "$LLM_CTR"; then
+    podman network exists "$LLM_NET" \
+      || podman network create --internal --disable-dns -o isolate=true \
+           --label "$LLM_LABEL=net" "$LLM_NET" >/dev/null
+    podman create --label "paddock.llm-hash=$hash" "${args[@]}" >/dev/null
+  fi
+  while IFS= read -r n; do llm_connect "$n"; done < <(llm_instances)
+  if ! ctr_running "$LLM_CTR"; then
+    info "starting $LLM_CTR with ${CFG[llm_model]} (loading the model can take a while)"
+    local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    podman start "$LLM_CTR" >/dev/null
+    wait_llm_ready "$since"
+  fi
+}
+
+# llama-server logs "listening on" once the model is loaded.
+wait_llm_ready() {
+  local since=$1 i
+  for ((i = 0; i < 1200; i++)); do   # up to 10 minutes
+    ctr_running "$LLM_CTR" || break
+    if podman logs --since "$since" "$LLM_CTR" 2>&1 \
+        | grep "listening on http://.*:$LLM_PORT" >/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  podman logs --tail 30 "$LLM_CTR" >&2 || true
+  die "$LLM_CTR did not become ready; see 'paddock llm logs'"
 }
 
 # ------------------------------------------------------------- AGENTS.md --
@@ -688,12 +908,23 @@ create_containers() {
     -v "$(instance_dir "$name")/proxy:/etc/paddock:$(mount_opt ro)" \
     "$PROXY_IMAGE" >/dev/null
 
-  local -a tenv=() gitv=()
+  local -a tenv=() gitv=() toolv=()
   if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
   mapfile -t gitv < <(git_mount_args "$ws")
   ((${#gitv[@]})) && gitv+=(--label paddock.git=protected)
-  local purl
+  local purl noproxy=localhost,127.0.0.1
   purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
+  load_tool "$tool"
+  if [[ -n ${TOOL[config_template]} ]]; then
+    write_tool_config "$name"
+    toolv+=(-v "$(instance_dir "$name")/tool-config:$(dirname "${TOOL[config_path]}"):$(mount_opt ro)")
+  fi
+  # Local-model tools talk to the shared model server directly: it joins this
+  # instance's internal network at a fixed address (see llm_connect).
+  if [[ ${TOOL[service]} == llm ]]; then
+    toolv+=(--add-host "$LLM_CTR:$(llm_ip "$name")")
+    noproxy+=",$LLM_CTR"
+  fi
   podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
     --label "paddock.tool=$tool" \
     --label "paddock.packages=$(IFS=,; printf '%s' "${pkgs[*]}")" \
@@ -705,11 +936,12 @@ create_containers() {
     -v "$(home_vol "$name"):/home/agent:U" \
     -v "$ws:/workspace:$(mount_opt bind)" \
     "${gitv[@]}" \
+    "${toolv[@]}" \
     -w /workspace \
     -e HOME=/home/agent \
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
     -e HTTP_PROXY="$purl"  -e http_proxy="$purl" \
-    -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
+    -e NO_PROXY="$noproxy" -e no_proxy="$noproxy" \
     "${tenv[@]}" \
     -e PADDOCK_INSTANCE="$name" -e PADDOCK_TOOL="$tool" \
     "$img" sleep infinity >/dev/null
@@ -732,13 +964,41 @@ start_instance() {
   local ws; ws=$(verify_workspace "$name")
   git_warnings "$name" "$ws"
   packages_warning "$name"
+  load_tool "$(instance_tool "$name")"
+  # Rendered on every start, so model setting changes apply without recreate.
+  write_tool_config "$name"
   if ! ctr_running "$pc"; then
     generate_proxy_config "$name"
     local since; since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     podman start "$pc" >/dev/null
     wait_proxy_ready "$pc" "$(proxy_ip "$name")" "$since"
   fi
+  # Starts the model server if needed and attaches it to this instance's
+  # (and every other local-model instance's) internal network.
+  [[ ${TOOL[service]} == llm ]] && llm_start
   ctr_running "$ac" || podman start "$ac" >/dev/null
+}
+
+# Render tools/<tool>/<config_template> for instance $1 (tool loaded in TOOL)
+# into instances/<name>/tool-config/, which is mounted read-only at the
+# directory of config_path. The directory is mounted rather than the file, so
+# a rewrite (new inode) is visible in a running instance.
+write_tool_config() {
+  local name=$1 src dir ctx
+  [[ -n ${TOOL[config_template]} ]] || return 0
+  src=$(data_file "tools/${TOOL[name]}/${TOOL[config_template]}") \
+    || die "tools/${TOOL[name]}/${TOOL[config_template]} not found"
+  dir="$(instance_dir "$name")/tool-config"
+  mkdir -p "$dir"; chmod 755 "$dir"
+  ctx=${CFG[llm_ctx]}
+  # All values are validated (no |, & or \), so they are safe in sed.
+  {
+    printf '# generated by paddock from tools/%s/%s - do not edit, rewritten on every start\n' \
+      "${TOOL[name]}" "${TOOL[config_template]}"
+    sed -e "s|@LLM_HOST@|$LLM_CTR|g" -e "s|@LLM_PORT@|$LLM_PORT|g" \
+        -e "s|@LLM_MODEL@|$(llm_alias)|g" -e "s|@LLM_CTX@|$ctx|g" \
+        -e "s|@LLM_COMPACT@|$((ctx * 8 / 10))|g" "$src"
+  } | atomic_write "$dir/$(basename "${TOOL[config_path]}")" 0644
 }
 
 # Warn if instance $1's packages changed since its containers were created.
@@ -862,6 +1122,7 @@ cmd_recreate() {
   done
   if ! { podman network exists "$(int_net "$name")" && podman network exists "$(ext_net "$name")"; }; then
     local n
+    llm_disconnect "$name"   # `network rm -f` would remove the model server too
     for n in "$(int_net "$name")" "$(ext_net "$name")"; do
       if podman network exists "$n"; then podman network rm -f "$n" >/dev/null; fi
     done
@@ -965,7 +1226,7 @@ cmd_rm() {
 cmd_list() {
   (($# == 0)) || die "usage: paddock list"
   local dir name ws state a p n np tool
-  printf '%-32s %-10s %-10s %-7s %-5s %s\n' NAME STATE TOOL DOMAINS PKGS WORKSPACE
+  printf '%-32s %-10s %-12s %-7s %-5s %s\n' NAME STATE TOOL DOMAINS PKGS WORKSPACE
   for dir in "$INSTANCES_DIR"/*/; do
     name=$(basename "$dir")
     [[ $name =~ $NAME_RE ]] || continue
@@ -977,7 +1238,7 @@ cmd_list() {
     tool=$(cat "$dir/tool" 2>/dev/null || echo '?')
     n=$(read_domains "$dir/domains.txt" 2>/dev/null | grep -c . || true)
     np=$(read_packages "$dir/packages.txt" 2>/dev/null | sort -u | grep -c . || true)
-    printf '%-32s %-10s %-10s %-7s %-5s %s\n' "$name" "$state" "$tool" "$n" "$np" "$ws"
+    printf '%-32s %-10s %-12s %-7s %-5s %s\n' "$name" "$state" "$tool" "$n" "$np" "$ws"
   done
 }
 
@@ -1149,7 +1410,8 @@ cmd_build() {
       *) [[ -z $tool ]] || die "unexpected argument '$1'"; tool=$1; shift ;;
     esac
   done
-  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] (tools: $(list_tools | paste -sd' '))"
+  [[ -n $tool ]] || die "usage: paddock build <tool>|llm [--version X] (tools: $(list_tools | paste -sd' '))"
+  if [[ $tool == llm ]]; then build_llm "$version"; return; fi
   load_tool "$tool"
   if [[ -z $version ]]; then
     [[ -n ${TOOL[npm_package]} ]] || die "tool '$tool' has no npm_package to resolve the latest version from; pass --version X"
@@ -1186,6 +1448,136 @@ cmd_build() {
   if [[ -n $old && $old != "$version" ]] && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
     info "existing $tool instances still use $AGENT_IMAGE_PREFIX$tool:$old; run 'paddock recreate <name>' to switch (login is kept)"
   fi
+}
+
+# Build the model server image: llama.cpp's llama-server from source at a
+# release tag (default: the latest release), for llm_backend.
+build_llm() {
+  local version=$1 backend=${CFG[llm_backend]}
+  if [[ -z $version ]]; then
+    need_cmd curl
+    info "resolving the latest llama.cpp release from GitHub"
+    version=$(curl -fsSL https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+              | grep -o '"tag_name": *"[^"]*"' | head -n1 | cut -d'"' -f4) \
+      || die "could not resolve the latest llama.cpp release; pass --version bNNNNN"
+  fi
+  [[ $version =~ $LLAMA_TAG_RE ]] || die "invalid llama.cpp version '$version' (a release tag, e.g. b12631)"
+
+  local ctx src
+  ctx=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$ctx'" EXIT
+  if [[ -d $CONFIG_DIR/build ]]; then cp -a "$CONFIG_DIR/build/." "$ctx/"; fi
+  src=$(data_file llm/Containerfile) || die "llm/Containerfile not found in $CONFIG_DIR or $DATA_DIR"
+  cp "$src" "$ctx/llm_Containerfile"
+
+  local tag="$version-$backend" img
+  img="$LLM_IMAGE_REPO:$tag"
+  info "building $img (llama.cpp $version, $backend backend; this compiles llama.cpp and takes a while)"
+  podman build --pull=newer -t "$img" --label paddock.image=llm \
+    --build-arg "LLAMA_VERSION=$version" --build-arg "BACKEND=$backend" \
+    -f "$ctx/llm_Containerfile" "$ctx"
+  local old; old=$(tool_version llm)
+  set_tool_version llm "$tag"
+  info "model server image is now $img"
+  if [[ -n $old && $old != "$tag" ]] && ctr_running "$LLM_CTR"; then
+    info "$LLM_CTR still runs $LLM_IMAGE_REPO:$old; run 'paddock llm restart' to switch"
+  fi
+}
+
+# Download a GGUF file from Hugging Face into the models dir. The file may
+# be in a subdirectory of the repository; a .gguf_file suffix (used for
+# alternative layouts) is renamed to .gguf. HF_TOKEN, if set, is sent for
+# gated repositories without appearing on the command line.
+llm_pull() {
+  local repo=$1 file=$2 base dir url
+  [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || die "invalid repository '$repo' (owner/name, e.g. unsloth/Inkling-2-Mini-GGUF)"
+  [[ $file =~ ^([A-Za-z0-9][A-Za-z0-9._+-]*/)*[A-Za-z0-9][A-Za-z0-9._+-]*\.gguf(_file)?$ ]] \
+    || die "invalid file '$file' (a .gguf file in the repository, e.g. Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file)"
+  base=${file##*/}; base=${base%_file}
+  [[ $base =~ $MODEL_FILE_RE ]] || die "invalid file name '$base'"
+  need_cmd curl
+  dir=$(llm_models_dir)
+  mkdir -p -- "$dir"
+  if [[ -f $dir/$base ]]; then info "$dir/$base already exists"; else
+    url="https://huggingface.co/$repo/resolve/main/$file"
+    info "downloading $url"
+    # -C -: resume a partial download from an earlier run. The token goes
+    # through a header file (process substitution), not the command line.
+    local rc=0
+    if [[ -n ${HF_TOKEN-} ]]; then
+      curl -fL --retry 3 -C - -H @<(printf 'Authorization: Bearer %s\n' "$HF_TOKEN") \
+        -o "$dir/$base.part" "$url" || rc=$?
+    else
+      curl -fL --retry 3 -C - -o "$dir/$base.part" "$url" || rc=$?
+    fi
+    ((rc == 0)) || die "download failed; run the same command again to resume"
+    mv -f -- "$dir/$base.part" "$dir/$base"
+    info "saved $dir/$base"
+  fi
+  if [[ ${CFG[llm_model]} != "$base" ]]; then
+    info "to use it, set llm_model=$base in $CONFIG_DIR/config"
+  fi
+}
+
+llm_status() {
+  local v state model nets n
+  v=$(tool_version llm)
+  model=${CFG[llm_model]:-(not set)}
+  state=$(ctr_state "$LLM_CTR")
+  if [[ -n $v ]]; then printf 'image     %s:%s\n' "$LLM_IMAGE_REPO" "$v"
+  else printf 'image     (not built; run paddock build llm)\n'; fi
+  printf 'backend   %s (devices: %s)\n' "${CFG[llm_backend]}" "$(llm_device_args | sed -n 's/^--device=//p' | paste -sd, | sed 's/^$/none/')"
+  printf 'model     %s' "$model"
+  if [[ -n ${CFG[llm_model]} ]]; then
+    if [[ -f $(llm_models_dir)/${CFG[llm_model]} ]]; then printf ' (%s)\n' "$(llm_models_dir)"
+    else printf ' (missing in %s)\n' "$(llm_models_dir)"; fi
+  else printf '\n'; fi
+  printf 'context   %s tokens\n' "${CFG[llm_ctx]}"
+  printf 'server    %s, http://%s:%s/v1 (model name %s)\n' "$state" "$LLM_CTR" "$LLM_PORT" "$(llm_alias)"
+  nets=$(llm_networks)
+  printf 'attached  '
+  local -a att=()
+  while IFS= read -r n; do
+    [[ -n $n ]] && att+=("$(sed -nE 's/^pd-(.+)-int$/\1/p' <<<"$n")")
+  done <<<"$nets"
+  if ((${#att[@]})); then printf '%s\n' "${att[*]}"; else printf '(none)\n'; fi
+}
+
+cmd_llm() {
+  local sub=${1-}; (($#)) && shift
+  case $sub in
+    start)
+      (($# == 0)) || die "usage: paddock llm start"
+      llm_start; info "$LLM_CTR is running" ;;
+    stop)
+      (($# == 0)) || die "usage: paddock llm stop"
+      if ctr_exists "$LLM_CTR"; then podman stop -t 10 "$LLM_CTR" >/dev/null; fi
+      info "$LLM_CTR stopped" ;;
+    restart)
+      (($# == 0)) || die "usage: paddock llm restart"
+      if ctr_exists "$LLM_CTR"; then podman rm -f -t 10 "$LLM_CTR" >/dev/null; fi
+      llm_start; info "$LLM_CTR is running" ;;
+    status)
+      (($# == 0)) || die "usage: paddock llm status"
+      llm_status ;;
+    logs)
+      local -a args=()
+      while (($#)); do
+        case $1 in
+          -f|--follow) args+=(--follow); shift ;;
+          -n|--tail) (($# >= 2)) || die "$1 needs a value"; args+=(--tail "$2"); shift 2 ;;
+          *) die "usage: paddock llm logs [-f] [-n N]" ;;
+        esac
+      done
+      ctr_exists "$LLM_CTR" || die "$LLM_CTR does not exist; start it with 'paddock llm start'"
+      exec podman logs "${args[@]}" "$LLM_CTR" ;;
+    pull)
+      (($# == 2)) || die "usage: paddock llm pull <hf-repo> <file>"
+      llm_pull "$1" "$2" ;;
+    *) die "usage: paddock llm start|stop|restart|status|logs|pull" ;;
+  esac
 }
 
 cmd_tools() {
@@ -1241,15 +1633,20 @@ cmd_purge() {
     esac
   done
   local -a names=() images=()
+  local llm=0 models=""
   if command -v podman >/dev/null 2>&1; then
     mapfile -t names < <(all_instance_names | grep -E "$NAME_RE" | sort -u)
     ((keep_images)) || mapfile -t images < <(paddock_images)
+    if podman container exists "$LLM_CTR" || podman network exists "$LLM_NET"; then llm=1; fi
   else
     warn "podman not found; only removing the config dir"
     local d; for d in "$INSTANCES_DIR"/*/; do names+=("$(basename "$d")"); done
   fi
+  # Only the default models dir: a configured llm_models_dir may be shared
+  # with other programs.
+  ((keep_images)) || { [[ -d $(llm_models_dir) ]] && models=$(llm_models_dir); }
 
-  if ((${#names[@]} == 0 && ${#images[@]} == 0)) && [[ ! -e $CONFIG_DIR ]]; then
+  if ((${#names[@]} == 0 && ${#images[@]} == 0 && llm == 0)) && [[ -z $models && ! -e $CONFIG_DIR ]]; then
     info "nothing to purge"; return 0
   fi
   {
@@ -1260,7 +1657,9 @@ cmd_purge() {
       else ws="no config left"; fi
       printf '  instance %-20s containers, networks, home volume (login); %s\n' "$n" "$ws"
     done
+    ((llm)) && printf '  llm      %s container and %s network\n' "$LLM_CTR" "$LLM_NET"
     for n in "${images[@]}"; do printf '  image    %s\n' "$n"; done
+    [[ -n $models ]] && printf '  models   %s (%s, downloaded models)\n' "$models" "$(du -sh -- "$models" 2>/dev/null | cut -f1)"
     [[ -e $CONFIG_DIR ]] && printf '  config   %s (settings, overrides, instance definitions)\n' "$CONFIG_DIR"
   } >&2
   if ((!force)); then
@@ -1268,6 +1667,12 @@ cmd_purge() {
   fi
 
   for n in "${names[@]}"; do remove_podman_objects "$n"; info "removed instance '$n'"; done
+  if ((llm)); then
+    podman rm -f -t 5 "$LLM_CTR" >/dev/null 2>&1 || true
+    podman network rm -f "$LLM_NET" >/dev/null 2>&1 || true
+    info "removed $LLM_CTR"
+  fi
+  if [[ -n $models ]]; then rm -rf -- "$models"; info "removed $models"; fi
   for n in "${images[@]}"; do
     podman image exists "$n" || continue   # an instance image, removed with its instance
     if podman rmi "$n" >/dev/null 2>&1; then info "removed image $n"
@@ -1370,6 +1775,27 @@ cmd_doctor() {
     fi
   fi
 
+  # Model server devices (only checked for a GPU llm_backend).
+  local llmb
+  llmb=$( [[ -n $DATA_DIR ]] && { load_config; printf '%s' "${CFG[llm_backend]-}"; } 2>/dev/null )
+  case $llmb in
+    vulkan|rocm)
+      local r ok_dev=0
+      for r in /dev/dri/renderD*; do [[ -r $r && -w $r ]] && ok_dev=1; done
+      if ((ok_dev)); then ok "llm_backend=$llmb: GPU render node accessible"
+      else meh "llm_backend=$llmb but no /dev/dri/renderD* is accessible to $user" \
+        "install the GPU driver; add $user to the group owning /dev/dri/renderD* (often render or video), then log in again"; fi
+      if [[ $llmb == rocm ]]; then
+        if [[ -r /dev/kfd && -w /dev/kfd ]]; then ok "llm_backend=rocm: /dev/kfd accessible"
+        else meh "llm_backend=rocm but /dev/kfd is not accessible to $user" "install ROCm's kernel driver (amdgpu) and add $user to the render group"; fi
+      fi ;;
+    cuda)
+      if [[ -n $(find /etc/cdi /var/run/cdi -name 'nvidia*.yaml' -o -name 'nvidia*.json' 2>/dev/null | head -n1) ]]; then
+        ok "llm_backend=cuda: NVIDIA CDI spec found"
+      else meh "llm_backend=cuda but no NVIDIA CDI spec in /etc/cdi or /var/run/cdi" \
+        "install nvidia-container-toolkit, then: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"; fi ;;
+  esac
+
   printf '%d problem(s), %d warning(s)\n' "$nfail" "$nwarn"
   ((nfail == 0))
 }
@@ -1394,6 +1820,10 @@ Usage: paddock <command> [args]
   packages <name> list|add|rm|edit [package...]       manage the instance's extra packages
   logs <name> [-f] [-n N] [--raw]                     proxy log of allowed/denied requests
   build <tool> [--version X]                          build proxy, base and tool images
+  build llm [--version bNNNNN]                        build the model server (llama.cpp tag)
+  llm start|stop|restart|status                       shared model server for local-model tools
+  llm logs [-f] [-n N]                                ... its log
+  llm pull <hf-repo> <file>                           download a GGUF model from Hugging Face
   tools                                               list available tools
   doctor                                              check that this host can run paddock
   purge [--force] [--keep-images]                     remove all instances, images and config
@@ -1433,6 +1863,7 @@ main() {
     packages) cmd_packages "$@" ;;
     logs)     cmd_logs "$@" ;;
     build)    cmd_build "$@" ;;
+    llm)      cmd_llm "$@" ;;
     tools)    cmd_tools "$@" ;;
     *) usage >&2; die "unknown command '$cmd'" ;;
   esac

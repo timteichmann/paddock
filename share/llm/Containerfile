@@ -1,0 +1,71 @@
+# paddock model server image: llama.cpp's llama-server, built from source at
+# a release tag. Built by `paddock build llm [--version bNNNNN]` with the
+# backend from llm_backend: cpu, vulkan, cuda or rocm.
+ARG BASE_IMAGE=docker.io/library/archlinux:latest
+
+FROM ${BASE_IMAGE} AS build
+ARG LLAMA_VERSION
+ARG BACKEND=cpu
+# CUDA only: GPU architectures to compile for (there is no GPU at build time
+# to detect them).
+ARG CUDA_ARCHITECTURES="75;80;86;89;90;120"
+RUN test -n "$LLAMA_VERSION" || { echo "LLAMA_VERSION build arg is required" >&2; exit 1; }
+
+RUN set -eu; \
+    pkgs="base-devel cmake git"; \
+    case "$BACKEND" in \
+      cpu)    ;; \
+      vulkan) pkgs="$pkgs vulkan-headers vulkan-icd-loader shaderc spirv-headers" ;; \
+      cuda)   pkgs="$pkgs cuda" ;; \
+      rocm)   pkgs="$pkgs rocm-hip-sdk" ;; \
+      *) echo "unknown BACKEND '$BACKEND' (cpu, vulkan, cuda or rocm)" >&2; exit 1 ;; \
+    esac; \
+    pacman -Syu --noconfirm --needed $pkgs
+
+RUN git clone --depth 1 --branch "$LLAMA_VERSION" https://github.com/ggml-org/llama.cpp /src
+WORKDIR /src
+
+# Static llama/ggml libraries: one binary. No web UI, no HTTPS client (the
+# server never downloads anything here). For CUDA, the CUDA libraries the
+# binary links (cudart, cublas, ...) are copied along; the driver library
+# (libcuda) comes from the host through CDI.
+RUN set -eu; \
+    opts=""; \
+    case "$BACKEND" in \
+      vulkan) opts="-DGGML_VULKAN=ON" ;; \
+      cuda)   . /etc/profile.d/cuda.sh; \
+              opts="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES" ;; \
+      rocm)   export HIPCXX="$(hipconfig -l)/clang" HIP_PATH="$(hipconfig -R)"; \
+              opts="-DGGML_HIP=ON" ;; \
+    esac; \
+    cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+      -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF \
+      $opts; \
+    cmake --build build --config Release -j"$(nproc)" --target llama-server; \
+    install -Dm755 build/bin/llama-server /opt/llama/bin/llama-server; \
+    mkdir -p /opt/llama/lib; \
+    if [ "$BACKEND" = cuda ]; then \
+      ldd /opt/llama/bin/llama-server | awk '$3 ~ /^\/opt\/cuda\// { print $3 }' \
+        | xargs -r cp -L -t /opt/llama/lib/; \
+    fi
+
+FROM ${BASE_IMAGE}
+ARG BACKEND=cpu
+RUN set -eu; \
+    pkgs=""; \
+    case "$BACKEND" in \
+      cpu)    ;; \
+      vulkan) pkgs="vulkan-icd-loader vulkan-radeon vulkan-intel" ;; \
+      cuda)   ;; \
+      rocm)   pkgs="rocm-hip-runtime hipblas rocblas" ;; \
+    esac; \
+    pacman -Syu --noconfirm --needed $pkgs \
+ && rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/* \
+ && find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
+
+COPY --from=build /opt/llama /opt/llama
+ENV PATH=/opt/llama/bin:/usr/local/bin:/usr/bin LD_LIBRARY_PATH=/opt/llama/lib HOME=/tmp
+# Without a GPU at build time only the CUDA build cannot start (no libcuda).
+RUN [ "$BACKEND" = cuda ] || llama-server --version
+LABEL paddock.image=llm

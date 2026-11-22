@@ -1,7 +1,8 @@
 # paddock
 
 Isolated coding-agent instances on rootless Podman. Supported tools: Claude Code
-(`claude`); more can be added as tool definitions. Each
+(`claude`) and the Codex CLI with a local model (`codex-local`, see
+[Local models](#local-models)); more can be added as tool definitions. Each
 instance sees exactly one host directory and can reach only an allowlist of
 domains, enforced by a per-instance Squid proxy that is the agent's only way out.
 
@@ -47,6 +48,9 @@ All images are built from `archlinux:latest`, whatever distro the host runs:
   version of the tool's npm package is resolved and pinned).
 - `paddock-inst:<name>`: only for instances with
   [extra packages](#per-instance-packages): the tool image plus those packages.
+- `paddock-llm:<tag>-<backend>`: only for [local models](#local-models):
+  llama.cpp's `llama-server`, compiled from source at a release tag for the
+  CPU, Vulkan, CUDA or ROCm.
 
 Claude Code runs with `DISABLE_AUTOUPDATER=1` and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry, error reporting
@@ -115,6 +119,18 @@ Log in once with `/login` inside Claude Code; the login lives in the instance's
 own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 (but not `rm`).
 
+With a local model instead (see [Local models](#local-models)):
+
+```bash
+paddock llm pull unsloth/Inkling-2-Mini-GGUF Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file
+echo 'llm_model=Inkling-2-Mini-UD-Q4_K_XL.gguf' >> ~/.config/paddock/config
+echo 'llm_backend=vulkan' >> ~/.config/paddock/config   # or cpu, cuda, rocm
+paddock build llm                   # compiles llama-server; paddock-llm:<tag>-vulkan
+paddock build codex-local           # paddock-codex-local:<latest Codex>
+paddock create codex-local api ~/src/api
+paddock attach api                  # starts paddock-llm if needed, runs codex
+```
+
 ## Commands
 
 | Command | |
@@ -130,9 +146,13 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 | `packages <name> list\|add\|rm\|edit` | extra pacman packages for this instance, see [Per-instance packages](#per-instance-packages). Takes effect on `recreate` |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
 | `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
+| `build llm [--version bNNNNN]` | builds the model server image for `llm_backend` from a llama.cpp release tag (default: the latest release) |
+| `llm start\|stop\|restart\|status` | the shared model server, see [Local models](#local-models). `start` happens automatically on `start`/`attach` of a local-model instance; `restart` applies changed `llm_*` settings, a new image or model |
+| `llm logs [-f] [-n N]` | the model server's log |
+| `llm pull <hf-repo> <file>` | downloads a GGUF file from Hugging Face into the models dir (resumable; sends `$HF_TOKEN` if set) |
 | `tools` | available tools, their built version and where their definition comes from |
-| `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir (`--keep-images` keeps the proxy, base and tool images; instance images go with their instance). Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
-| `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |
+| `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the model server, the `localhost/paddock-*` images, the downloaded models in the default models dir and the config dir (`--keep-images` keeps the proxy, base, tool and model server images and the models; instance images go with their instance; a configured `llm_models_dir` is never removed). Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
+| `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel, GPU access for `llm_backend`) and prints distro-specific fixes. Exits non-zero if something required is missing |
 
 `attach` and `shell` pass your terminal's `TERM` and `COLORTERM` into the
 instance, so Claude Code shows full colors. If the agent image has no terminfo
@@ -157,12 +177,23 @@ share/
   Containerfile.base          shared base of all agent images
   PADDOCK.md                  sandbox notes for the agent, built into the base image
   AGENTS.md                   default AGENTS.md written into workspaces
+  llm/Containerfile           model server image (build args LLAMA_VERSION, BACKEND)
   tools/<tool>/
-    tool.conf                 command, yolo_args, npm_package
+    tool.conf                 command, yolo_args, npm_package; optional service,
+                              config_template, config_path (see below)
     Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
     domains.txt               domains every instance of this tool may reach
     env                       environment set in the agent container (KEY=VALUE)
+    <config_template>         optional, e.g. codex-local/config.toml
 ```
+
+Optional `tool.conf` keys: `service=llm` makes the tool's instances use the
+shared [model server](#local-models). `config_template=<file>` and
+`config_path=/etc/<dir>/<file>` render `<file>` from the tool directory for
+each instance on every start (placeholders `@LLM_HOST@`, `@LLM_PORT@`,
+`@LLM_MODEL@`, `@LLM_CTX@`, `@LLM_COMPACT@`, 80% of the context) and mount it
+read-only at `config_path`; its directory is mounted, so it must be one of its
+own.
 
 Your own files live in the config directory. A file there at the same relative
 path as a data file replaces it, e.g. `~/.config/paddock/domains.txt` or
@@ -184,6 +215,8 @@ new directory `~/.config/paddock/tools/<tool>/` with a `tool.conf` and a
     domains.txt               per-instance extra domains
     packages.txt              per-instance extra pacman packages (see below)
     proxy/                    generated: squid.conf + allowlist.txt (mounted read-only into the proxy)
+    tool-config/              generated from config_template (mounted read-only into the agent)
+~/.cache/paddock/models/      downloaded models (llm_models_dir)
 ```
 
 An instance's allowlist is `domains.txt` + `tools/<tool>/domains.txt` +
@@ -193,7 +226,8 @@ source.
 `config` settings (empty value disables a limit): `agent_memory=4g`,
 `agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
 `proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts), `agents_md=yes`
-(`no`: never add `AGENTS.md` to workspaces). Limit and `env` changes take effect
+(`no`: never add `AGENTS.md` to workspaces), and the `llm_*` settings of the
+[model server](#local-models). Limit and `env` changes take effect
 on `paddock recreate <name>`.
 
 ### Per-instance packages
@@ -228,6 +262,109 @@ paddock packages game list|rm|edit
   starting with `-` or `.`). For AUR packages or anything else, override the
   tool's Containerfile (see [Files](#files)); that applies to all instances of
   the tool.
+
+### Local models
+
+Tools with `service=llm`, such as `codex-local`, run on a model on your own
+hardware instead of a cloud API. One model server serves all of them:
+
+```
+ pd-a-int (codex-local)                pd-b-int (codex-local)       pd-c-int (claude)
+ ┌───────────┐  ┌────────────┐          ┌───────────┐  ┌──────────┐  ┌───────────┐ ┌──────────┐
+ │ pd-a-agent│  │ pd-a-proxy │          │ pd-b-agent│  │pd-b-proxy│  │ pd-c-agent│ │pd-c-proxy│
+ └─────┬─────┘  └────────────┘          └─────┬─────┘  └──────────┘  └───────────┘ └──────────┘
+       │ http://paddock-llm:8080 (direct)     │                       no path to paddock-llm
+       └──────────────┐     ┌─────────────────┘
+               ┌──────┴─────┴─────┐  paddock-llm-net (internal, nothing else on it)
+               │   paddock-llm    │  llama-server, no route out,
+               │   GPU devices    │  model file read-only
+               └──────────────────┘
+```
+
+- **One container, `paddock-llm`,** runs `llama-server` with the model file
+  mounted read-only. It sits on its own internal network and joins the
+  internal network of each local-model instance at a fixed address (the
+  second-to-last of the subnet; the proxy has the last). It never joins the
+  network of any other instance, so Claude Code instances have no path to it.
+  It has no route out and no proxy access: each proxy denies its address.
+- **Agents reach it directly** as `paddock-llm:8080` (an `/etc/hosts` entry and
+  `NO_PROXY`), not through their proxy. The `codex-local` tool needs no
+  domains at all.
+- **Started on demand:** `start` and `attach` of a local-model instance start
+  it if needed and wait until the model is loaded. `paddock llm stop` stops
+  it; it is not stopped with the instances. If you change `llm_*` settings, the
+  image or the model file, it is recreated on its next start, or now with
+  `paddock llm restart` (which interrupts running local-model sessions).
+- **API only:** `--no-webui` and `--no-slots` (the slots endpoint shows other
+  clients' prompts); llama-server's built-in tools, MCP and `/props` writes stay
+  off. Rootless, `--cap-drop=ALL`, `no-new-privileges`, read-only root
+  filesystem, `llm_*` resource limits.
+
+Setup:
+
+1. Pick the backend in `~/.config/paddock/config`: `llm_backend=cpu`,
+   `vulkan` (AMD and Intel GPUs, Mesa drivers in the image), `cuda` (NVIDIA;
+   needs nvidia-container-toolkit and a CDI spec,
+   `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`) or `rocm`
+   (AMD). `paddock doctor` checks GPU access. The GPU is passed through with
+   `--device` and `--group-add keep-groups` (`llm_devices=auto`; keep-groups
+   needs the crun runtime, Podman's default on current distributions); set
+   `llm_devices` to choose devices yourself.
+2. `paddock build llm` compiles `llama-server` for that backend at the latest
+   llama.cpp release (or `--version bNNNNN`). Inkling 2 Mini needs **b12611 or
+   later**: earlier releases produce gibberish with it.
+3. `paddock llm pull <hf-repo> <file>` downloads a GGUF file into
+   `~/.cache/paddock/models` (`llm_models_dir`); set `llm_model=<file>.gguf`.
+4. `paddock build codex-local`, then create instances with
+   `paddock create codex-local <name> <path>`.
+
+Settings (`llm_*` in `config`):
+
+| Setting | Default | |
+| --- | --- | --- |
+| `llm_backend` | `cpu` | `cpu`, `vulkan`, `cuda` or `rocm`; takes effect on `paddock build llm` |
+| `llm_model` | | GGUF file name in the models dir |
+| `llm_models_dir` | `~/.cache/paddock/models` | absolute path |
+| `llm_ctx` | `65536` | context size in tokens, shared by all requests of all instances. Codex compacts its history at 80% of it |
+| `llm_args` | Inkling 2 Mini sampling | extra `llama-server` arguments, split on whitespace (no quoting) |
+| `llm_devices` | `auto` | `auto` (by backend), empty, or podman `--device` values separated by commas |
+| `llm_memory`, `llm_cpus`, `llm_pids_limit` | `""`, `""`, `1024` | resource limits |
+
+#### Inkling 2 Mini
+
+[Inkling 2 Mini](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) is a
+26B mixture-of-experts model with 3.4B active parameters (its middle layers run
+three times, so compute per token is closer to 5.4B), Apache 2.0, made for
+agentic and coding use. For llama.cpp use the files in `Mainline_Support/`
+(the repository root holds a layout only Unsloth's own builds read); `pull`
+renames their `.gguf_file` suffix to `.gguf`. The quant should fit your GPU
+memory together with the context:
+
+| Quant | Size |
+| --- | --- |
+| `UD-Q3_K_XL` | 13.6 GB |
+| `UD-IQ4_XS` | 15.7 GB |
+| `UD-Q4_K_XL` | 17.6 GB (recommended where it fits) |
+| `UD-Q8_K_XL` | 22.9 GB |
+
+The model card recommends temperature 1.0 without truncation (top-p 1.0,
+top-k off, min-p 0), the default `llm_args`. It also warns that the model can
+get stuck in long reasoning loops, may delete or overwrite files without
+asking, and may misreport its results: keep Codex's approvals on (no `--yolo`)
+and review its changes.
+
+#### codex-local
+
+`codex-local` is OpenAI's Codex CLI (npm package `@openai/codex`) configured
+for the model server through `/etc/codex/config.toml`, its system config:
+provider `paddock-llm` with the Responses API (`llama-server` serves
+`/v1/responses`), the model's context window, no web search, update checks,
+analytics or feedback uploads. Codex's own sandbox is off
+(`sandbox_mode = "danger-full-access"`), since paddock is the sandbox;
+approvals stay on (`approval_policy = "on-request"`), and `attach --yolo` turns
+them off. No OpenAI account or login is needed. To change a setting for one
+instance, put it in `~/.codex/config.toml` inside the instance; for all
+instances, override `tools/codex-local/config.toml` in the config dir.
 
 ### Agent instructions
 
@@ -309,6 +446,11 @@ mounted read-only as a whole.
   port 80; destinations that resolve to loopback, RFC 1918, CGNAT, link-local,
   documentation/benchmark ranges, multicast, and IPv6 ULA/link-local/mapped/NAT64
   are denied even when the name is allowlisted. No TLS interception.
+- **Model server:** see [Local models](#local-models). It joins only the
+  internal networks of local-model instances, has no route out, and each proxy
+  denies its address. It does not route between the networks it is on: paddock
+  turns IP forwarding off in its network namespace, and without capabilities
+  it cannot turn it on (agents cannot add routes through it either).
 - **Hardening:** both containers run with `--cap-drop=ALL`, `no-new-privileges`,
   pids/memory/cpu limits, no `--privileged`, no devices, and no host network,
   PID or IPC namespaces. The proxy runs as an unprivileged user on a read-only
@@ -337,6 +479,11 @@ passed through). `arch-pkg` copies the checkout, runs `makepkg` in
 plus extra checks, and cleans up. Overrides: `PD_TEST_DENIED` (domain toggled in
 test 5, default `example.com`), `PD_TEST_DOMAIN2` (default `example.org`),
 `PD_TEST_PUBLIC_DNS=0` (skip the nip.io private-IP check), `PD_TEST_KEEP=1`.
+The local-model checks (instances `t4`/`t5`: model server reachable from
+local-model instances only, no route out, no proxy use, survives instance
+removal) run when `paddock build llm`, `llm_model` with its file and
+`paddock build codex-local` are in place; `PD_TEST_LLM=0` skips them. They send
+one short request to the model.
 
 ## Known limitations
 
@@ -350,6 +497,16 @@ test 5, default `example.com`), `PD_TEST_DOMAIN2` (default `example.org`),
   you run them on the host: build files, scripts, tests, `.envrc`, editor
   settings and the like run with your full permissions there.
 - Kernel and Podman escapes are out of scope; use a VM for untrusted code.
+- **Shared model server:** all local-model instances share `paddock-llm`. An
+  agent that exploits a bug in `llama-server` could read the other
+  local-model instances' prompts (their code) and alter the model's answers to
+  them, i.e. steer those agents and, through their workspaces, what you later
+  run on the host. Instances of other tools are not affected (no path to it).
+  Requests also queue behind each other, and one instance can slow down the
+  rest. Do not mix trusted and untrusted projects among local-model instances.
+- **GPU passthrough** gives the model server access to the GPU driver, a large
+  kernel interface. A container escape through it needs a `llama-server` bug
+  first; `llm_backend=cpu` avoids it.
 
 ## License
 

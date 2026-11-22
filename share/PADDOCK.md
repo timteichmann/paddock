@@ -18,6 +18,11 @@ The instance name used in all commands is in `$PADDOCK_INSTANCE`
 - You run as an unprivileged user. There is no root and no `sudo`.
 - All network traffic goes through an HTTP(S) proxy (`$HTTPS_PROXY`) that only
   allows domains on an allowlist. There is no DNS and no direct internet route.
+- If you run on a local model (`$PADDOCK_TOOL` is e.g. `codex-local`), it is
+  served at `http://paddock-llm:8080/v1`, reached directly, not through the
+  proxy. The user's other local-model instances share it. It runs on the
+  user's own hardware, so prompts can be slow; do not send it load tests or
+  other requests of your own.
 
 ## Initial setup
 

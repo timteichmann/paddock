@@ -38,7 +38,7 @@ _paddock() {
     words=("${COMP_WORDS[@]}") cword=$COMP_CWORD
   fi
 
-  local cmds="create start attach shell stop rm recreate list ls domains packages logs build tools doctor purge help version"
+  local cmds="create start attach shell stop rm recreate list ls domains packages logs build llm tools doctor purge help version"
   if ((cword == 1)); then
     mapfile -t COMPREPLY < <(compgen -W "$cmds" -- "$cur")
     return
@@ -103,7 +103,12 @@ _paddock() {
       esac ;;
     build)
       opts="--version"
-      ((n == 1)) && list=$(_paddock_tools) ;;
+      ((n == 1)) && list="$(_paddock_tools) llm" ;;
+    llm)
+      case ${args[0]-} in
+        logs) opts="--follow --tail" ;;
+      esac
+      ((n == 1)) && list="start stop restart status logs pull" ;;
     purge)
       opts="--force --keep-images" ;;
     *) return ;;

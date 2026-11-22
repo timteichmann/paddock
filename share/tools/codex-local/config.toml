@@ -1,0 +1,30 @@
+# Codex settings for paddock's shared local model server.
+model_provider = "paddock-llm"
+model = "@LLM_MODEL@"
+model_context_window = @LLM_CTX@
+model_auto_compact_token_limit = @LLM_COMPACT@
+
+# paddock already sandboxes the agent; Codex's own sandbox (bubblewrap) is
+# not needed and may not work inside the container. Commands still need
+# your approval unless you use `paddock attach --yolo`.
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+
+# Nothing but the model server is reachable: no web search, update checks,
+# analytics or feedback uploads.
+web_search = "disabled"
+check_for_update_on_startup = false
+
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[model_providers.paddock-llm]
+name = "paddock local model"
+base_url = "http://@LLM_HOST@:@LLM_PORT@/v1"
+wire_api = "responses"
+# A local model can take a while to process a long prompt before its first token.
+stream_idle_timeout_ms = 900000
+request_max_retries = 1

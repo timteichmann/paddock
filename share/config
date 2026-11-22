@@ -12,3 +12,25 @@ relabel=
 # Add a default AGENTS.md (pointing to /etc/paddock/PADDOCK.md) to the
 # workspace on create/recreate if it has none: yes or no.
 agents_md=yes
+
+# Shared model server (paddock-llm) for local-model tools such as codex-local.
+# Backend llama.cpp is built for by `paddock build llm`: cpu, vulkan (AMD and
+# Intel GPUs), cuda (NVIDIA, needs a CDI spec) or rocm (AMD).
+llm_backend=cpu
+# GGUF file in the models dir, e.g. Inkling-2-Mini-UD-Q4_K_XL.gguf
+# (`paddock llm pull` downloads into the models dir).
+llm_model=
+# Models dir; empty: ~/.cache/paddock/models.
+llm_models_dir=
+# Context size in tokens, shared by all requests of all instances.
+llm_ctx=65536
+# Extra llama-server arguments, split on whitespace (no quoting). The default
+# is the sampling recommended for Inkling 2 Mini.
+llm_args=--temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0
+# Devices for the server: auto (by llm_backend: /dev/dri, /dev/kfd or the
+# CDI device nvidia.com/gpu=all), empty for none, or podman --device values
+# separated by commas.
+llm_devices=auto
+llm_memory=
+llm_cpus=
+llm_pids_limit=1024

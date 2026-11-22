@@ -1,0 +1,2 @@
+# Domains every codex-local instance may reach. None: the model server is
+# reached directly, not through the proxy, and Codex needs no OpenAI account.

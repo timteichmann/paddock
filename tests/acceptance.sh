@@ -17,6 +17,9 @@
 #   PD_TEST_PUBLIC_DNS 1 = also check that an allowlisted public name resolving
 #                      to 192.168.1.1 (via nip.io) is denied (default: 1)
 #   PD_TEST_KEEP       1 = keep instances on failure for debugging
+#   PD_TEST_LLM        0 = skip the local-model tests (default: run them when
+#                      `paddock build llm`, a model and `paddock build
+#                      codex-local` are in place)
 
 set -uo pipefail
 
@@ -25,7 +28,7 @@ PADDOCK=${PADDOCK:-$HERE/../paddock}
 DENIED=${PD_TEST_DENIED:-example.com}
 DOMAIN2=${PD_TEST_DOMAIN2:-example.org}
 PUBLIC_DNS=${PD_TEST_PUBLIC_DNS:-1}
-T1=t1 T2=t2  # t3 is used for the extra checks
+T1=t1 T2=t2  # t3 is used for the extra checks, t4/t5 for local models
 WS1=/tmp/pd-t1 WS2=/tmp/pd-t2
 MARK="paddock-test-marker-$$-$RANDOM"
 HOME_MARK="$HOME/.$MARK"
@@ -71,11 +74,14 @@ no_path() {
 proxy_ip() { podman inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "pd-'"$1"'-int"}}{{$v.IPAddress}}{{end}}{{end}}' "pd-$1-proxy"; }
 cfg_dir() { printf '%s/paddock' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
 
-# The purge test removes the paddock images and config dir. It keeps them by
-# tagging the images under a backup name first (podman keeps the layers) and
-# copying the config dir; purge_restore puts both back, also from cleanup.
+# The purge test removes the paddock images, config dir and downloaded models.
+# It keeps them by tagging the images under a backup name first (podman keeps
+# the layers), copying the config dir and moving the models dir aside;
+# purge_restore puts them back, also from cleanup.
 PURGE_CFG_BAK=""
+PURGE_MODELS_BAK=""
 declare -a PURGE_TAGS=()
+models_dir() { printf '%s/paddock/models' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
 bak_tag() { printf 'localhost/pdtest-bak-%s' "${1#localhost/}"; }
 purge_restore() {
   local t
@@ -87,6 +93,12 @@ purge_restore() {
     rm -rf "$(cfg_dir)" && cp -a "$PURGE_CFG_BAK" "$(cfg_dir)" && rm -rf "$PURGE_CFG_BAK"
     PURGE_CFG_BAK=""
   fi
+  if [[ $PURGE_MODELS_BAK == *.pdtest-none ]]; then
+    rm -rf "$(models_dir)" && rmdir "$PURGE_MODELS_BAK"
+  elif [[ -n $PURGE_MODELS_BAK ]]; then
+    rm -rf "$(models_dir)" && mv "$PURGE_MODELS_BAK" "$(models_dir)"
+  fi
+  PURGE_MODELS_BAK=""
 }
 paddock_images() { podman images --format '{{.Repository}}:{{.Tag}}' | grep '^localhost/paddock-'; }
 # Instances other than the given ones: configured, or with podman objects left.
@@ -109,6 +121,10 @@ cleanup() {
   pd rm "$T1" --force >/dev/null 2>&1
   pd rm "$T2" --force >/dev/null 2>&1
   pd rm t3 --force >/dev/null 2>&1
+  pd rm t4 --force >/dev/null 2>&1
+  pd rm t5 --force >/dev/null 2>&1
+  [[ ${LLM_WAS_RUNNING-1} == 0 ]] && podman stop -t 5 paddock-llm >/dev/null 2>&1
+  rm -rf /tmp/pd-t4 /tmp/pd-t5
   rm -f "$HOME_MARK"
   [[ -n ${CREATED_WS1-} ]] && rm -rf "$WS1"
   [[ -n ${CREATED_WS2-} ]] && rm -rf "$WS2"
@@ -382,6 +398,77 @@ check_not "rm removes the instance image" podman image exists localhost/paddock-
 check_not "... and earlier untagged builds" bash -c "podman images -q --filter label=paddock.instance=t3 | grep -q ."
 rm -rf "$WS3"
 
+section "extra: local model (shared model server)"
+llm_tests_ready() {
+  [[ ${PD_TEST_LLM:-1} != 0 ]] || return 1
+  "$PADDOCK" tools | awk '$1 == "codex-local" { print $2 }' | grep -qv 'not built' || return 1
+  ! "$PADDOCK" llm status 2>/dev/null | grep -qE 'not built|not set|missing'
+}
+llm_networks() { podman inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' paddock-llm | sed '/^$/d'; }
+llm_ip_on() { podman inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "pd-'"$1"'-int"}}{{$v.IPAddress}}{{end}}{{end}}' paddock-llm; }
+llm_code() { ax "$1" curl -s -o /dev/null -m "${3:-20}" -w '%{http_code}' "http://paddock-llm:8080$2" 2>/dev/null; }
+# The status line of a CONNECT sent through the proxy at $1 from the model server.
+llm_connect_via() {
+  podman exec paddock-llm timeout 10 bash -c "exec 3<>/dev/tcp/$1/3128 &&
+    printf 'CONNECT $2:443 HTTP/1.1\r\nHost: $2:443\r\n\r\n' >&3 && head -n1 <&3" 2>/dev/null
+}
+if ! llm_tests_ready; then
+  skip "local-model tests: need 'paddock build llm', llm_model with its file, and 'paddock build codex-local' (or PD_TEST_LLM=0)"
+else
+  LLM_WAS_RUNNING=0
+  [[ $(podman inspect --format '{{.State.Status}}' paddock-llm 2>/dev/null) == running ]] && LLM_WAS_RUNNING=1
+  rm -rf /tmp/pd-t4 /tmp/pd-t5
+  check "create codex-local t4" pd create codex-local t4 /tmp/pd-t4 --no-agents-md
+  check "start t4 (starts the model server and waits for the model)" pd start t4
+  check "model server running" test "$(podman inspect --format '{{.State.Status}}' paddock-llm)" = running
+  check "codex runs in t4" ax t4 codex --version
+  check "t4 has the rendered Codex config" ax t4 grep -qF 'base_url = "http://paddock-llm:8080/v1"' /etc/codex/config.toml
+  check_not "... read-only" ax t4 sh -c 'echo x >> /etc/codex/config.toml'
+  check "t4 reaches the model server directly (/health 200)" test "$(llm_code t4 /health)" = 200
+  ALIAS=$(sed -n 's/^model = "\(.*\)"$/\1/p' "$(cfg_dir)/instances/t4/tool-config/config.toml")
+  check "/v1/models lists the configured model ($ALIAS)" \
+    bash -c "podman exec pd-t4-agent curl -s -m 20 http://paddock-llm:8080/v1/models | grep -qF -- \"\$1\"" _ "$ALIAS"
+  check "a Responses API request gets an answer (HTTP 200)" \
+    test "$(ax t4 curl -s -o /dev/null -m 600 -w '%{http_code}' -H 'Content-Type: application/json' \
+            -d '{"input":"Reply with OK.","max_output_tokens":512}' http://paddock-llm:8080/v1/responses)" = 200
+  check_not "/slots is disabled" test "$(llm_code t4 /slots)" = 200
+  check_not "no web UI" bash -c "podman exec pd-t4-agent curl -s -m 20 http://paddock-llm:8080/ | grep -qi '<html'"
+  check "llm status lists t4 as attached" bash -c "'$PADDOCK' llm status | grep -E '^attached' | grep -qw t4"
+
+  check "create + start codex-local t5" bash -c "'$PADDOCK' create codex-local t5 /tmp/pd-t5 --no-agents-md && '$PADDOCK' start t5"
+  check "t5 reaches the model server too" test "$(llm_code t5 /health)" = 200
+  L4=$(llm_ip_on t4); L5=$(llm_ip_on t5)
+  check "model server is on only its own and the local-model networks" \
+    bash -c "$(declare -f llm_networks); llm_networks | grep -vxE 'paddock-llm-net|pd-t4-int|pd-t5-int' | grep -q . && exit 1 || exit 0"
+  check_not "model server is not on $T2's (claude) network" bash -c "$(declare -f llm_networks); llm_networks | grep -qx pd-$T2-int"
+  check_not "$T2 (claude) has no paddock-llm host entry" ax "$T2" getent hosts paddock-llm
+  check "$T2 (claude) has no path to the model server ($L4:8080)" no_path "$T2" "$L4" 8080
+  check "$T2 (claude) has no path to the model server ($L5:8080)" no_path "$T2" "$L5" 8080
+  check "$T2's proxy refuses the model server's address (403)" test "$(http_code "$T2" "http://$L4:8080/health")" = 403
+  T5A=$(podman inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' pd-t5-agent)
+  check "t4 has no path to t5's agent ($T5A)" no_path t4 "$T5A" 22
+  check "t4 has no path to t5's proxy" no_path t4 "$(proxy_ip t5)" 3128
+
+  pd domains t4 add "$DOMAIN2" >/dev/null 2>&1
+  check "control: t4's agent may CONNECT to $DOMAIN2 (200)" test "$(connect_code t4 "https://$DOMAIN2")" = 200
+  check "model server may not use t4's proxy (403)" bash -c "$(declare -f llm_connect_via); llm_connect_via '$(proxy_ip t4)' '$DOMAIN2' | grep -q ' 403'"
+  check "model server has no default route" bash -c "! podman exec paddock-llm cat /proc/net/route | awk 'NR>1 && \$2==\"00000000\"' | grep -q ."
+  check_not "model server cannot reach 1.1.1.1:443" podman exec paddock-llm timeout 8 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'
+  check "model server does not forward IPv4" test "$(podman exec paddock-llm cat /proc/sys/net/ipv4/ip_forward)" = 0
+  check_not "... and cannot turn it on" podman exec paddock-llm sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+
+  check "rm t5" pd rm t5 --force
+  check "model server survives the removal of t5's network" test "$(podman inspect --format '{{.State.Status}}' paddock-llm)" = running
+  check_not "... and is detached from it" bash -c "$(declare -f llm_networks); llm_networks | grep -qx pd-t5-int"
+  check "recreate t4" bash -c "'$PADDOCK' recreate t4 && '$PADDOCK' start t4"
+  check "t4 still reaches the model server" test "$(llm_code t4 /health)" = 200
+  check "llm stop" pd llm stop
+  check "start t4 starts the model server again" bash -c "'$PADDOCK' start t4 && podman inspect --format '{{.State.Status}}' paddock-llm | grep -qx running"
+  check "rm t4" pd rm t4 --force
+  ((LLM_WAS_RUNNING)) || podman stop -t 5 paddock-llm >/dev/null 2>&1
+  rm -rf /tmp/pd-t4 /tmp/pd-t5
+fi
+
 section "extra: purge"
 # purge removes *all* instances of this user, so it only runs when no
 # instances other than the test's own exist.
@@ -394,6 +481,15 @@ else
   pd create claude t3 "$WS3" >/dev/null 2>&1 && pd start t3 >/dev/null 2>&1
   PURGE_CFG_BAK=$(mktemp -d)/paddock
   cp -a "$(cfg_dir)" "$PURGE_CFG_BAK"
+  # Downloaded models: moved aside (same filesystem, no copy), and a dummy
+  # models dir in their place for purge to remove.
+  if [[ -e $(models_dir) ]]; then
+    PURGE_MODELS_BAK="$(models_dir).pdtest-bak"
+    mv "$(models_dir)" "$PURGE_MODELS_BAK"
+  else
+    PURGE_MODELS_BAK="$(models_dir).pdtest-none"; mkdir -p "$PURGE_MODELS_BAK"
+  fi
+  mkdir -p "$(models_dir)" && : >"$(models_dir)/dummy.gguf"
   mapfile -t PURGE_TAGS < <(paddock_images)
   for t in "${PURGE_TAGS[@]}"; do podman tag "$t" "$(bak_tag "$t")"; done
   check "images present before purge (${#PURGE_TAGS[@]})" test "${#PURGE_TAGS[@]}" -gt 0
@@ -411,8 +507,12 @@ else
   check_not "config dir removed" test -e "$(cfg_dir)"
   check "workspaces kept" test -d "$WS3" -a -d "$WS2"
   check "--keep-images kept the images" test "$(paddock_images | wc -l)" -eq "${#PURGE_TAGS[@]}"
+  check "--keep-images kept the models" test -f "$(models_dir)/dummy.gguf"
   check "purge --force removes the images" pd purge --force
   check_not "no localhost/paddock-* images remain" bash -c "$(declare -f paddock_images); paddock_images | grep -q ."
+  check_not "downloaded models removed" test -e "$(models_dir)"
+  check_not "model server container and network removed" \
+    bash -c "podman container exists paddock-llm || podman network exists paddock-llm-net"
   check "other images kept (backup tags)" podman image exists "$(bak_tag "${PURGE_TAGS[0]}")"
   check_not "config dir not recreated" test -e "$(cfg_dir)"
   check "purge again: nothing to purge" bash -c "'$PADDOCK' purge --force 2>&1 | grep -q 'nothing to purge'"

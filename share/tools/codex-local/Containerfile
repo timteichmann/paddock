@@ -1,0 +1,16 @@
+# paddock agent image for the Codex CLI. Built by `paddock build codex-local [--version X]`.
+ARG PADDOCK_BASE=localhost/paddock-base:latest
+FROM ${PADDOCK_BASE}
+
+ARG TOOL_VERSION
+RUN test -n "$TOOL_VERSION" || { echo "TOOL_VERSION build arg is required" >&2; exit 1; }
+
+# The npm package ships its native binary as a platform-specific optional
+# dependency, so no install scripts are needed. The setuid strip is repeated
+# in case the install added such files.
+RUN npm install -g --no-fund --no-audit "@openai/codex@${TOOL_VERSION}" \
+ && npm cache clean --force \
+ && codex --version \
+ && find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
+
+LABEL paddock.image=agent paddock.tool=codex-local
