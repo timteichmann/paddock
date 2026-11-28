@@ -1,7 +1,7 @@
 # paddock default settings (KEY=VALUE). Override single keys in
 # ~/.config/paddock/config. An empty value disables a limit.
 agent_memory=4g
-agent_cpus=2
+agent_cpus=8
 agent_pids_limit=2048
 proxy_memory=256m
 proxy_cpus=0.5

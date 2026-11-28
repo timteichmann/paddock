@@ -192,7 +192,7 @@ An instance's allowlist is `domains.txt` + `tools/<tool>/domains.txt` +
 source.
 
 `config` settings (empty value disables a limit): `agent_memory=4g`,
-`agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
+`agent_cpus=8`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
 `proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit and `env` changes take effect
 on `paddock recreate <name>`.
 
