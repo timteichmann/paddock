@@ -51,7 +51,9 @@ All images are built from `archlinux:latest`, whatever distro the host runs:
 Claude Code runs with `DISABLE_AUTOUPDATER=1` and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry, error reporting
 or update checks), so only the allowlisted API and login hosts are contacted.
-Arch is rolling, so a rebuild picks up current packages.
+Arch is rolling, but podman reuses cached layers until the `archlinux:latest`
+image itself changes; `paddock build <tool> --refresh` rebuilds every layer
+with current packages. Run `paddock recreate <name>` afterwards.
 
 ## Install
 
@@ -119,17 +121,17 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <tool> <name> <path> [--domains d1,d2] [--packages p1,p2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths). Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
+| `create <tool> <name> <path> [--domains d1,d2] [--packages p1,p2]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths) |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
 | `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
 | `rm <name> [--force]` | removes containers, networks, home volume and config. Never touches the workspace |
-| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login). Adds `AGENTS.md` to the workspace if missing |
+| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login) |
 | `list` | name, state, tool, number of extra domains and packages, workspace |
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
 | `packages <name> list\|add\|rm\|edit` | extra pacman packages for this instance, see [Per-instance packages](#per-instance-packages). Takes effect on `recreate` |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
-| `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
+| `build <tool> [--version X] [--refresh]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned. `--refresh` rebuilds without the layer cache, to pick up current Arch packages |
 | `tools` | available tools, their built version and where their definition comes from |
 | `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir (`--keep-images` keeps the proxy, base and tool images; instance images go with their instance). Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
 | `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |
@@ -156,9 +158,8 @@ share/
   Containerfile.proxy
   Containerfile.base          shared base of all agent images
   PADDOCK.md                  sandbox notes for the agent, built into the base image
-  AGENTS.md                   default AGENTS.md written into workspaces
   tools/<tool>/
-    tool.conf                 command, yolo_args, npm_package
+    tool.conf                 command, yolo_args, npm_package, protect_paths
     Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
     domains.txt               domains every instance of this tool may reach
     env                       environment set in the agent container (KEY=VALUE)
@@ -191,9 +192,8 @@ An instance's allowlist is `domains.txt` + `tools/<tool>/domains.txt` +
 source.
 
 `config` settings (empty value disables a limit): `agent_memory=4g`,
-`agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
-`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts), `agents_md=yes`
-(`no`: never add `AGENTS.md` to workspaces). Limit and `env` changes take effect
+`agent_cpus=8`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
+`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit and `env` changes take effect
 on `paddock recreate <name>`.
 
 ### Per-instance packages
@@ -238,17 +238,21 @@ exact `paddock domains <instance> add ...` or `paddock packages <instance> add .
 command.
 The instance name comes from `$PADDOCK_INSTANCE`.
 
-So that agents read it, `create` and `recreate` write a short `AGENTS.md` into
-the workspace that points to that file. Claude Code and other agents read
-`AGENTS.md` automatically. paddock never overwrites an existing `AGENTS.md`;
-if your project already has one, add a reference to `/etc/paddock/PADDOCK.md`
-yourself if you want it. Skip it per instance with `create --no-agents-md` or
-for all instances with `agents_md=no` in `config`.
+So that the agent reads it in every session, each tool's image also has it
+where the tool looks for global instructions; for Claude Code that is
+`/etc/claude-code/CLAUDE.md`, its managed instructions file. It is read in
+addition to the project's own `CLAUDE.md`/`AGENTS.md`, owned by root and so
+read-only for the agent, and nothing is written into your workspace.
 
-Both files can be overridden in the config dir (`PADDOCK.md`, `AGENTS.md`). A
-changed `PADDOCK.md` takes effect after `paddock build <tool>` and
-`paddock recreate <name>`; if you override `Containerfile.base`, keep its
-`COPY PADDOCK.md` line.
+`PADDOCK.md` can be overridden in the config dir. A changed `PADDOCK.md` takes
+effect after `paddock build <tool>` and `paddock recreate <name>`; if you
+override `Containerfile.base` or a tool's `Containerfile`, keep their
+`COPY PADDOCK.md` lines.
+
+Earlier versions wrote an `AGENTS.md` pointing to `/etc/paddock/PADDOCK.md`
+into workspaces. paddock leaves such files alone; delete them if you no
+longer want them. `create --no-agents-md` and the `agents_md` setting are
+ignored with a warning.
 
 ### Workspace paths
 
@@ -289,12 +293,55 @@ mounted read-only as a whole.
   warn when it exists.
 - Changes you make to `.git/config` on the host (e.g. `git remote add`) are
   visible in the instance after `paddock recreate <name>`.
-- Repositories in subdirectories of the workspace are not protected.
+- With `extensions.worktreeConfig` set, `.git/config.worktree` is mounted
+  read-only as well (created empty if missing).
+
+**Nested repositories are not protected.** The agent can create a repository
+in a subdirectory (or change a submodule's `.git` file or `.git/modules/*`)
+and set its `core.fsmonitor` or hooks. If the workspace's index lists it as a
+submodule, which the agent can also arrange, `git status`, `git diff` or
+`git add` in the workspace on the host runs git in it with that config. The
+same applies to linked worktrees (`.git/worktrees/*`). paddock cannot prevent
+this without taking `.git` away from the agent, so `start` and `stop` warn
+when the workspace has nested repositories, submodule repositories in
+`.git/modules`, or a linked worktree whose `commondir` points elsewhere.
+When you see such a warning:
+
+- remove nested repositories you did not create yourself, and check the
+  config and hooks of the others (`<dir>/.git/config`, `<dir>/.git/hooks`)
+  before running git in the workspace;
+- `git -c diff.ignoreSubmodules=all status` and `... diff` do not run git in
+  submodules; `git add` still does.
+
+### Tool settings in the workspace
+
+Coding agents read settings from the project, and some of them run commands:
+Claude Code runs hooks from `.claude/settings.json` and
+`.claude/settings.local.json`, and MCP servers from `.mcp.json`. If you also run
+the tool on the host in the same directory, settings the agent wrote there
+would run with your full permissions. So paddock mounts the tool's
+`protect_paths` (from its `tool.conf`) read-only in the instance; for Claude
+Code `.claude/` and `.mcp.json`.
+
+- A directory entry (trailing `/`, e.g. `.claude/`) is created in the
+  workspace if it is missing, so it is protected from the start. A file entry
+  (e.g. `.mcp.json`) is only protected if it exists when the containers are
+  created; if it appears later, `start` and `stop` warn until you check it and
+  run `paddock recreate <name>`.
+- The agent in the instance cannot change these settings either. Claude Code
+  there stores permission rules you allow with "don't ask again" in
+  `~/.claude/settings.json` in the instance's home volume. To change the
+  project's settings, edit them on the host and run `paddock recreate <name>`.
+- Entries are single names directly in the workspace. Instructions such as
+  `CLAUDE.md` stay writable: they cannot run commands, but review changes to
+  them like any other file.
 
 ## How isolation works
 
 - **Filesystem:** only the workspace is bind-mounted (`/workspace`), with
-  `.git/config` and `.git/hooks` read-only (see [Git](#git)). Home is a
+  `.git/config` and `.git/hooks` read-only (see [Git](#git)), and the tool's
+  project settings read-only (see
+  [Tool settings in the workspace](#tool-settings-in-the-workspace)). Home is a
   per-instance named volume, so one instance cannot plant hooks or settings in
   another. No host sockets, no `$HOME`, no host credentials.
 - **Ownership:** `--userns=keep-id --user $UID:$GID`. Files created by the agent
@@ -302,7 +349,8 @@ mounted read-only as a whole.
 - **Network:** the agent is only on `pd-<n>-int` (`--internal`, no gateway, no
   default route, `--disable-dns`, `--dns=none`). It reaches the proxy through a
   static `/etc/hosts` entry, so DNS tunnelling is not available either. Programs
-  that ignore `HTTPS_PROXY` simply fail.
+  that ignore `HTTPS_PROXY` simply fail. `NODE_USE_ENV_PROXY=1` is set so that
+  Node's built-in `fetch` uses the proxy too.
 - **Proxy:** Squid listens only on its internal-network address. Policy is
   default deny: source must be the instance's subnet; host must be allowlisted
   (`dstdomain -n`, no reverse DNS); `CONNECT` only to 443; plain HTTP only to

@@ -69,7 +69,7 @@ _paddock() {
   local opts="" list=""
   case $cmd in
     create)
-      opts="--domains --packages --no-agents-md"
+      opts="--domains --packages"
       case $n in
         1) list=$(_paddock_tools) ;;
         3) [[ $cur != -* ]] && { compopt -o filenames 2>/dev/null
@@ -102,7 +102,7 @@ _paddock() {
              | grep -vxF -f <(printf '%s\n' "${args[@]:2}") ) ;;
       esac ;;
     build)
-      opts="--version"
+      opts="--version --refresh"
       ((n == 1)) && list=$(_paddock_tools) ;;
     purge)
       opts="--force --keep-images" ;;

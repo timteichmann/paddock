@@ -12,6 +12,10 @@ The instance name used in all commands is in `$PADDOCK_INSTANCE`
 
 - `/workspace` is the user's project directory (a bind mount). Files you
   create there are owned by the user on the host.
+- Your tool's project settings in `/workspace` are read-only (for Claude Code
+  `.claude/` and `.mcp.json`; `git` config and hooks too, see Git below).
+  Keep settings you need in your home directory (e.g.
+  `~/.claude/settings.json`), or ask the user to change the project's.
 - Your home directory (`$HOME`) is a private volume that survives restarts.
   The rest of the container's filesystem is reset when the user runs
   `paddock recreate`.

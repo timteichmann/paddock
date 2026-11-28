@@ -104,9 +104,12 @@ parse_kv() {
 declare -A CFG=()
 load_config() {
   parse_kv "$DATA_DIR/config" CFG new
+  # agents_md is no longer used; accepted so that old configs still load.
+  [[ -v CFG[agents_md] ]] || CFG[agents_md]=""
   [[ -f $CONFIG_DIR/config ]] && parse_kv "$CONFIG_DIR/config" CFG
+  [[ -z ${CFG[agents_md]} ]] \
+    || warn "config: agents_md is no longer used (paddock does not write AGENTS.md into workspaces); remove it from $CONFIG_DIR/config"
   [[ ${CFG[relabel]-} =~ ^[zZ]?$ ]] || die "config: relabel must be empty, 'z' or 'Z'"
-  [[ ${CFG[agents_md]-} =~ ^(yes|no)$ ]] || die "config: agents_md must be 'yes' or 'no'"
   local k
   for k in agent_pids_limit proxy_pids_limit; do
     [[ ${CFG[$k]-} =~ ^[0-9]*$ ]] || die "config: $k must be a number or empty"
@@ -150,9 +153,16 @@ load_tool() {
   [[ $t =~ $NAME_RE && $t != base && $t != proxy && $t != inst ]] || die "invalid tool name '$t'"
   f=$(data_file "tools/$t/tool.conf") \
     || die "unknown tool '$t' (available: $(list_tools | paste -sd' '))"
-  TOOL=([command]="" [yolo_args]="" [npm_package]="")
+  TOOL=([command]="" [yolo_args]="" [npm_package]="" [protect_paths]="")
   parse_kv "$f" TOOL
   [[ -n ${TOOL[command]} ]] || die "$f: command is required"
+  local p
+  for p in ${TOOL[protect_paths]}; do
+    # One top-level name: a mount point cannot be renamed, but the agent could
+    # rename a parent directory of a deeper one and put its own in place.
+    [[ $p =~ ^[A-Za-z0-9._-]+/?$ && ${p%/} != . && ${p%/} != .. && ${p%/} != .git ]] \
+      || die "$f: invalid protect_paths entry '$p' (a file or dir/ directly in the workspace, not .git)"
+  done
   TOOL[name]=$t
 }
 
@@ -178,21 +188,24 @@ normalize_domain() {
   printf '%s' "$d"
 }
 
-# Print validated domains from a file (comments/blank lines ignored).
+# Print validated domains from a file (comments/blank lines ignored; several
+# domains on a line are separated by whitespace), one per line.
 read_domains() {
-  local f=$1 line n=0 d
+  local f=$1 line n=0 w d
+  local -a words
   [[ -f $f ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     line="${line%%#*}"
-    line="${line//[[:space:]]/}"
-    [[ -z $line ]] && continue
-    d=${line,,}
-    if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
-      printf 'paddock: error: %s:%d: invalid domain %q\n' "$f" "$n" "$line" >&2
-      return 1
-    fi
-    printf '%s\n' "$d"
+    read -r -a words <<<"$line"   # no glob expansion, unlike an unquoted $line
+    for w in "${words[@]}"; do
+      d=${w,,}
+      if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
+        printf 'paddock: error: %s:%d: invalid domain %q\n' "$f" "$n" "$w" >&2
+        return 1
+      fi
+      printf '%s\n' "$d"
+    done
   done <"$f"
 }
 
@@ -594,27 +607,6 @@ wait_proxy_ready() {
   die "proxy $pc did not become ready"
 }
 
-# ------------------------------------------------------------- AGENTS.md --
-
-# Add the default AGENTS.md (it points the agent to /etc/paddock/PADDOCK.md,
-# baked into the base image) to the instance's workspace, unless the
-# workspace already has one, the instance was created with --no-agents-md,
-# or agents_md=no. Never overwrites: noclobber also covers a file that
-# appears between the check and the write.
-write_agents_md() {
-  local name=$1 dir ws src
-  dir=$(instance_dir "$name")
-  [[ ${CFG[agents_md]} == yes && ! -e $dir/no-agents-md ]] || return 0
-  ws=$(<"$dir/workspace")
-  [[ -e $ws/AGENTS.md || -L $ws/AGENTS.md ]] && return 0
-  src=$(data_file AGENTS.md) || { warn "AGENTS.md not found in $CONFIG_DIR or $DATA_DIR; none added"; return 0; }
-  if (set -C; cat -- "$src" >"$ws/AGENTS.md") 2>/dev/null; then
-    info "added $ws/AGENTS.md (points the agent to /etc/paddock/PADDOCK.md)"
-  else
-    [[ -e $ws/AGENTS.md ]] || warn "could not write $ws/AGENTS.md"
-  fi
-}
-
 # ------------------------------------------------------------------- git --
 
 # git on the host runs commands from .git/config (core.fsmonitor, core.pager,
@@ -638,20 +630,122 @@ git_mount_args() { # ws
     printf -- '-v\n%s:/workspace/.git:%s\n' "$g" "$(mount_opt bind)"
     printf -- '-v\n%s:/workspace/.git/config:%s\n' "$g/config" "$(mount_opt ro,bind)"
     printf -- '-v\n%s:/workspace/.git/hooks:%s\n' "$g/hooks" "$(mount_opt ro,bind)"
+    # With extensions.worktreeConfig, git also reads .git/config.worktree.
+    if git_worktree_config "$g"; then
+      if [[ -L $g/config.worktree ]]; then
+        warn "$g/config.worktree is a symlink; it is not protected"
+      else
+        [[ -e $g/config.worktree ]] || : >"$g/config.worktree"
+        printf -- '-v\n%s:/workspace/.git/config.worktree:%s\n' "$g/config.worktree" "$(mount_opt ro,bind)"
+      fi
+    fi
   fi
 }
 
-# Warnings about the workspace's .git that the mounts cannot cover.
+# True if the repository config $1/config enables extensions.worktreeConfig.
+# Parsed with grep: running host git on the workspace is what we guard against.
+git_worktree_config() {
+  grep -qiE '^[[:space:]]*worktreeconfig[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$1/config" 2>/dev/null
+}
+
+# Up to 5 nested .git entries (directories or files) below workspace $1,
+# relative to it; a 6th line "..." if there are more. The top-level .git is
+# skipped, and so is what lies inside any .git.
+nested_git_dirs() {
+  local ws=$1
+  find "$ws" -mindepth 1 -name .git -prune -printf '%P\n' 2>/dev/null \
+    | grep -vxF .git | awk 'NR <= 5 { print; next } { print "..."; exit }' || true
+}
+
+# --------------------------------------------------------- protected paths --
+
+# The tool's protect_paths (tool.conf) are files and directories in the
+# workspace that the tool run on the host reads and may run commands from,
+# e.g. hooks in Claude Code's .claude/settings.json. They are mounted
+# read-only in the agent. An entry with a trailing / is a directory, created
+# if missing; a file entry is protected only if it exists. Needs load_tool.
+
+# Prints -v arguments for the protected paths of workspace $1.
+protect_mount_args() { # ws
+  local ws=$1 e p
+  for e in ${TOOL[protect_paths]}; do
+    p=${e%/}
+    if [[ -L $ws/$p ]]; then
+      warn "$ws/$p is a symlink; it is not protected"; continue
+    fi
+    if [[ ! -e $ws/$p ]]; then
+      [[ $e == */ ]] || continue
+      mkdir -- "$ws/$p"
+    fi
+    printf -- '-v\n%s:/workspace/%s:%s\n' "$ws/$p" "$p" "$(mount_opt ro,bind)"
+  done
+}
+
+# Names (comma-separated) of the protected paths among -v arguments on stdin.
+protected_names() {
+  sed -n 's|^.*:/workspace/\([^/:]*\):.*$|\1|p' | grep -vxF .git | paste -sd, || true
+}
+
+# Before instance $1's agent starts: re-create missing protected directories
+# (podman cannot start with a missing bind source) and refuse a missing file.
+# Warn about protected paths that exist but are not mounted read-only. With
+# $3 = warn-only (stop), only warn.
+protect_check() { # name ws [warn-only]
+  local name=$1 ws=$2 mode=${3-} e p label
+  label=$(podman container inspect --format '{{index .Config.Labels "paddock.protected"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
+  for e in ${TOOL[protect_paths]}; do
+    p=${e%/}
+    if [[ ,$label, == *",$p,"* ]]; then
+      if [[ ! -e $ws/$p && ! -L $ws/$p && $mode != warn-only ]]; then
+        [[ $e == */ ]] || die "$ws/$p was removed; run 'paddock recreate $name'"
+        mkdir -- "$ws/$p"
+      fi
+    elif [[ -e $ws/$p || -L $ws/$p ]]; then
+      warn "$ws/$p is not mounted read-only in '$name' (created after the instance?); ${TOOL[command]} on the host may run commands from it. Check it, then run 'paddock recreate $name' to protect it"
+    fi
+  done
+  return 0
+}
+
+# Warnings about git state in workspace $2 that the mounts cannot cover: git
+# on the host would run commands configured there (core.fsmonitor, hooks, ...).
 git_warnings() { # name ws
-  local name=$1 g="$2/.git" label
+  local name=$1 ws=$2 g="$2/.git" label d nested
+  # Nested repositories (also submodule checkouts, whose .git is a file the
+  # agent can point anywhere). `git status` or `git add` in the workspace runs
+  # git in each submodule the index lists, with that repository's config.
+  nested=$(nested_git_dirs "$ws" | paste -sd' ')
+  if [[ -n $nested ]]; then
+    warn "nested git repositories in $ws ($nested): their config and hooks are writable by the agent, and git on the host runs them, also from 'git status' in $ws. See 'Git' in the paddock README before using git there"
+  fi
   [[ -e $g || -L $g ]] || return 0
   label=$(podman container inspect --format '{{index .Config.Labels "paddock.git"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
   if [[ $label != protected ]]; then
     warn "$g is not mounted read-only in '$name' (created after the instance?); run 'paddock recreate $name' to protect it"
   fi
+  [[ -d $g ]] || return 0
   # git reads config and hooks from the directory named in commondir.
   if [[ -e $g/commondir ]]; then
     warn "$g/commondir exists; git on the host reads config and hooks from the directory it names. Check it before using git there"
+  fi
+  # Submodule repositories keep their own config and hooks here.
+  if [[ -n $(find "$g/modules" -name config -type f -print -quit 2>/dev/null) ]]; then
+    warn "$g/modules has submodule repositories; their config and hooks are writable by the agent. Check them before using git on the host"
+  fi
+  # A linked worktree's commondir normally names this .git ("../.."); its
+  # config.worktree is read when extensions.worktreeConfig is on.
+  for d in "$g"/worktrees/*/; do
+    if [[ -e $d/commondir && $(cat "$d/commondir" 2>/dev/null) != ../.. ]]; then
+      warn "${d%/}/commondir names another directory; git in that worktree reads config and hooks from there"
+    fi
+    if [[ -e $d/config.worktree ]] && git_worktree_config "$g"; then
+      warn "${d%/}/config.worktree is writable by the agent; check it before using git in that worktree"
+    fi
+  done
+  if git_worktree_config "$g"; then
+    label=$(podman container inspect --format '{{index .Config.Labels "paddock.git-worktree-config"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
+    [[ $label == protected ]] \
+      || warn "$g/config.worktree is not mounted read-only in '$name' (extensions.worktreeConfig set after the instance?); run 'paddock recreate $name'"
   fi
   return 0
 }
@@ -691,7 +785,12 @@ create_containers() {
   local -a tenv=() gitv=()
   if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
   mapfile -t gitv < <(git_mount_args "$ws")
+  local -a protv=()
+  load_tool "$tool"
+  mapfile -t protv < <(protect_mount_args "$ws")
+  protv+=(--label "paddock.protected=$(printf '%s\n' "${protv[@]}" | protected_names)")
   ((${#gitv[@]})) && gitv+=(--label paddock.git=protected)
+  [[ " ${gitv[*]} " == *":/workspace/.git/config.worktree:"* ]] && gitv+=(--label paddock.git-worktree-config=protected)
   local purl
   purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
   podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
@@ -705,11 +804,13 @@ create_containers() {
     -v "$(home_vol "$name"):/home/agent:U" \
     -v "$ws:/workspace:$(mount_opt bind)" \
     "${gitv[@]}" \
+    "${protv[@]}" \
     -w /workspace \
     -e HOME=/home/agent \
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
     -e HTTP_PROXY="$purl"  -e http_proxy="$purl" \
     -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
+    -e NODE_USE_ENV_PROXY=1 \
     "${tenv[@]}" \
     -e PADDOCK_INSTANCE="$name" -e PADDOCK_TOOL="$tool" \
     "$img" sleep infinity >/dev/null
@@ -731,6 +832,8 @@ start_instance() {
   { ctr_exists "$pc" && ctr_exists "$ac"; } || die "containers for '$name' are missing; run 'paddock recreate $name'"
   local ws; ws=$(verify_workspace "$name")
   git_warnings "$name" "$ws"
+  load_tool "$(instance_tool "$name")"
+  protect_check "$name" "$ws"
   packages_warning "$name"
   if ! ctr_running "$pc"; then
     generate_proxy_config "$name"
@@ -771,10 +874,10 @@ term_env_args() {
 # --------------------------------------------------------------- commands --
 
 cmd_create() {
-  local tool="" name="" path="" domains_csv="" packages_csv="" agents_md=1
+  local tool="" name="" path="" domains_csv="" packages_csv=""
   while (($#)); do
     case $1 in
-      --no-agents-md) agents_md=0; shift ;;
+      --no-agents-md) warn "--no-agents-md is no longer needed: paddock does not write AGENTS.md into workspaces"; shift ;;
       --domains) (($# >= 2)) || die "--domains needs a value"; domains_csv=$2; shift 2 ;;
       --domains=*) domains_csv=${1#*=}; shift ;;
       --packages) (($# >= 2)) || die "--packages needs a value"; packages_csv=$2; shift 2 ;;
@@ -784,7 +887,7 @@ cmd_create() {
          elif [[ -z $path ]]; then path=$1; else die "unexpected argument '$1'"; fi; shift ;;
     esac
   done
-  [[ -n $tool && -n $name && -n $path ]] || die "usage: paddock create <tool> <name> <path> [--domains d1,d2,...] [--packages p1,p2,...] [--no-agents-md]"
+  [[ -n $tool && -n $name && -n $path ]] || die "usage: paddock create <tool> <name> <path> [--domains d1,d2,...] [--packages p1,p2,...]"
   load_tool "$tool"
   validate_name "$name"
   local dir; dir=$(instance_dir "$name")
@@ -834,14 +937,12 @@ cmd_create() {
     if ((${#domains[@]})); then printf '%s\n' "${domains[@]}" | sort -u; fi
   } | atomic_write "$dir/domains.txt" 0644
   if ((${#packages[@]})); then printf '%s\n' "${packages[@]}"; fi | write_instance_packages "$name"
-  ((agents_md)) || : | atomic_write "$dir/no-agents-md" 0644
 
   local -a pkgs; load_packages "$name" pkgs
   build_inst_image "$name" "${pkgs[@]}" || die "could not build the image for '$name' (unknown package?)"
   create_networks_and_volume "$name"
   create_containers "$name"
   trap - EXIT
-  write_agents_md "$name"
   info "created $tool instance '$name' (workspace $ws). Start it with: paddock start $name"
 }
 
@@ -876,7 +977,6 @@ cmd_recreate() {
     podman rmi "$(inst_image "$name")" >/dev/null 2>&1 || true
   fi
   rm_dangling_inst_image "$old"
-  write_agents_md "$name"
   info "recreated containers for '$name' with $(instance_image "$name") (home volume kept)"
 }
 
@@ -893,7 +993,12 @@ cmd_stop() {
   for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
     ctr_exists "$c" && podman stop -t 5 "$c" >/dev/null
   done
-  [[ -f $(instance_dir "$name")/workspace ]] && git_warnings "$name" "$(<"$(instance_dir "$name")/workspace")"
+  if [[ -f $(instance_dir "$name")/workspace ]]; then
+    local ws; ws=$(<"$(instance_dir "$name")/workspace")
+    git_warnings "$name" "$ws"
+    load_tool "$(instance_tool "$name")"
+    protect_check "$name" "$ws" warn-only
+  fi
   info "instance '$name' stopped"
 }
 
@@ -1116,11 +1221,13 @@ cmd_logs() {
       -f|--follow) follow=1; shift ;;
       --raw) raw=1; shift ;;
       -n|--tail) (($# >= 2)) || die "$1 needs a value"; tail=$2; shift 2 ;;
+      --tail=*) tail=${1#*=}; shift ;;
       -*) die "unknown option '$1'" ;;
       *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1; shift ;;
     esac
   done
   [[ -n $name ]] || die "usage: paddock logs <name> [-f] [-n N] [--raw]"
+  [[ -z $tail || $tail =~ ^[1-9][0-9]{0,8}$ ]] || die "-n needs a positive number, not '$tail'"
   require_instance "$name"
   local pc; pc=$(proxy_ctr "$name")
   ctr_exists "$pc" || die "proxy container $pc does not exist"
@@ -1140,16 +1247,17 @@ cmd_logs() {
 }
 
 cmd_build() {
-  local tool="" version=""
+  local tool="" version="" refresh=0
   while (($#)); do
     case $1 in
+      --refresh) refresh=1; shift ;;
       --version) (($# >= 2)) || die "--version needs a value"; version=$2; shift 2 ;;
       --version=*) version=${1#*=}; shift ;;
       -*) die "unknown option '$1'" ;;
       *) [[ -z $tool ]] || die "unexpected argument '$1'"; tool=$1; shift ;;
     esac
   done
-  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] (tools: $(list_tools | paste -sd' '))"
+  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] [--refresh] (tools: $(list_tools | paste -sd' '))"
   load_tool "$tool"
   if [[ -z $version ]]; then
     [[ -n ${TOOL[npm_package]} ]] || die "tool '$tool' has no npm_package to resolve the latest version from; pass --version X"
@@ -1172,19 +1280,25 @@ cmd_build() {
     cp "$src" "$ctx/${f//\//_}"
   done
 
+  # Cached layers keep the packages of their first build until the Arch image
+  # itself changes; --refresh rebuilds every layer to get current packages.
+  local -a nocache=()
+  ((refresh)) && nocache=(--no-cache)
   local img="$AGENT_IMAGE_PREFIX$tool:$version"
   info "building $PROXY_IMAGE"
-  podman build --pull=newer -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
+  podman build --pull=newer "${nocache[@]}" -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
   info "building $BASE_IMAGE"
-  podman build --pull=newer -t "$BASE_IMAGE" -f "$ctx/Containerfile.base" "$ctx"
+  podman build --pull=newer "${nocache[@]}" -t "$BASE_IMAGE" -f "$ctx/Containerfile.base" "$ctx"
   info "building $img"
-  podman build --pull=never -t "$img" --build-arg "PADDOCK_BASE=$BASE_IMAGE" \
+  podman build --pull=never "${nocache[@]}" -t "$img" --build-arg "PADDOCK_BASE=$BASE_IMAGE" \
     --build-arg "TOOL_VERSION=$version" -f "$ctx/tools_${tool}_Containerfile" "$ctx"
   local old; old=$(tool_version "$tool")
   set_tool_version "$tool" "$version"
   info "$tool image is now $img"
   if [[ -n $old && $old != "$version" ]] && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
     info "existing $tool instances still use $AGENT_IMAGE_PREFIX$tool:$old; run 'paddock recreate <name>' to switch (login is kept)"
+  elif ((refresh)) && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
+    info "existing $tool instances keep the previous image until 'paddock recreate <name>' (login is kept)"
   fi
 }
 
@@ -1382,7 +1496,6 @@ Usage: paddock <command> [args]
 
   create <tool> <name> <path> [--domains d1,d2,...]   create an instance (not started)
          [--packages p1,p2,...]                       ... with extra pacman packages
-         [--no-agents-md]                             ... without adding AGENTS.md to <path>
   start <name>                                        start proxy, then agent
   attach <name> [--yolo] [-- tool args]               run the tool in /workspace
   shell <name>                                        bash in the agent container
@@ -1393,7 +1506,7 @@ Usage: paddock <command> [args]
   domains <name> list|add|rm|edit [domain...]         manage the instance allowlist
   packages <name> list|add|rm|edit [package...]       manage the instance's extra packages
   logs <name> [-f] [-n N] [--raw]                     proxy log of allowed/denied requests
-  build <tool> [--version X]                          build proxy, base and tool images
+  build <tool> [--version X] [--refresh]              build proxy, base and tool images
   tools                                               list available tools
   doctor                                              check that this host can run paddock
   purge [--force] [--keep-images]                     remove all instances, images and config

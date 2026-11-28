@@ -129,7 +129,7 @@ trap cleanup EXIT
 CREATED_WS1=1 CREATED_WS2=1
 
 # ---------------------------------------------------------------- tests --
-section "11. runs as a normal user (checked up front)"
+section "preflight: runs as a normal user (spec test 11)"
 check_not "not running as root (EUID=$EUID)" test "$EUID" -eq 0
 check "podman is rootless" test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
 # Quoted strings are dropped first: `paddock doctor` prints "sudo ..." fix hints.
@@ -144,6 +144,8 @@ check "list shows $T1 running" bash -c "'$PADDOCK' list | awk '\$1==\"$T1\" {pri
 section "2. allowlist enforced by the proxy"
 check "https://api.anthropic.com gets an HTTP response" got_response "$T1" https://api.anthropic.com
 check "https://$DENIED is denied by the proxy (403)" proxy_denied "$T1" "https://$DENIED"
+check "node fetch() goes through the proxy" \
+  ax "$T1" node -e "fetch('https://api.anthropic.com').then(() => process.exit(0), () => process.exit(1))"
 check "plain http://$DENIED is denied (403)" test "$(http_code "$T1" "http://$DENIED")" = 403
 check "allowlisted domain on a non-443 port is denied" proxy_denied "$T1" https://api.anthropic.com:8443
 check "proxy log records the denial" test "$(verdict "$T1" "$DENIED")" = DENIED
@@ -195,6 +197,13 @@ check_not "domains add rejects an IP" pd domains "$T1" add 1.2.3.4
 check_not "domains add rejects a URL" pd domains "$T1" add https://example.net/x
 check_not "domains add rejects a port" pd domains "$T1" add example.net:443
 check_not "domains add rejects a glob" pd domains "$T1" add '*.example.net'
+printf 'a.example.net b.example.net # two on a line\n' >>"$(cfg_dir)/instances/$T1/domains.txt"
+check "domains on one line are read as separate entries" \
+  bash -c "'$PADDOCK' domains $T1 list | grep -qE '^instance +a\.example\.net$' && '$PADDOCK' domains $T1 list | grep -qE '^instance +b\.example\.net$'"
+pd domains "$T1" rm a.example.net b.example.net >/dev/null 2>&1
+check_not "logs -n 0 is refused" pd logs "$T1" -n 0
+check_not "logs -n x is refused" pd logs "$T1" -n x
+check "logs -n 1 prints one line" test "$(pd logs "$T1" -n 1 | wc -l)" -eq 1
 
 section "6. workspace ownership"
 check "agent creates /workspace/from-agent" ax "$T1" sh -c 'echo agent > /workspace/from-agent'
@@ -226,8 +235,8 @@ check_not "no git credentials or forge URL rewrites in the agent" \
   bash -c "podman exec pd-$T1-agent git config --show-origin --list 2>/dev/null | grep -qiE 'credential|insteadof'"
 check_not "paddock config dir not mounted" \
   bash -c "podman exec pd-$T1-agent cat /proc/self/mountinfo | grep -qF '$(cfg_dir)'"
-check "workspace is the only host directory bind-mounted" \
-  bash -c "podman inspect --format '{{range .Mounts}}{{.Type}}={{.Source}}{{\"\\n\"}}{{end}}' pd-$T1-agent | grep '^bind=' | grep -vxF 'bind=$WS1' | grep -vE '^bind=.*/(userdata|containers/storage)/' | grep -q . && exit 1 || exit 0"
+check "only the workspace (and paths in it) is bind-mounted" \
+  bash -c "podman inspect --format '{{range .Mounts}}{{.Type}}={{.Source}}{{\"\\n\"}}{{end}}' pd-$T1-agent | grep '^bind=' | grep -vxF 'bind=$WS1' | grep -vF 'bind=$WS1/' | grep -vE '^bind=.*/(userdata|containers/storage)/' | grep -q . && exit 1 || exit 0"
 
 section "8. two concurrent instances"
 check "create claude $T2 $WS2 --domains $DOMAIN2" pd create claude "$T2" "$WS2" --domains "$DOMAIN2"
@@ -280,26 +289,22 @@ check "start t3" pd start t3
 check "recreate t3 keeps working" bash -c "'$PADDOCK' recreate t3 && '$PADDOCK' start t3"
 check "rm t3" pd rm t3 --force
 
-section "extra: AGENTS.md and PADDOCK.md"
+section "extra: agent instructions (PADDOCK.md)"
 WS3=/tmp/pd-t3
 rm -rf "$WS3"
 check "create claude t3 $WS3" pd create claude t3 "$WS3"
-check "AGENTS.md added to a workspace without one" grep -qF /etc/paddock/PADDOCK.md "$WS3/AGENTS.md"
-check "AGENTS.md owned by host user" test "$(stat -c %u "$WS3/AGENTS.md" 2>/dev/null)" = "$(id -u)"
+check_not "no AGENTS.md written into the workspace" test -e "$WS3/AGENTS.md"
 check "start t3" pd start t3
 check "PADDOCK.md readable in the agent" ax t3 grep -qF 'paddock domains' /etc/paddock/PADDOCK.md
+check "Claude Code's managed CLAUDE.md is PADDOCK.md" ax t3 sh -c 'test "$(sha256sum </etc/paddock/PADDOCK.md)" = "$(sha256sum </etc/claude-code/CLAUDE.md)"'
+check_not "agent cannot change it" ax t3 sh -c 'echo x >> /etc/claude-code/CLAUDE.md'
 check "PADDOCK_INSTANCE is set in the agent" test "$(ax t3 printenv PADDOCK_INSTANCE)" = t3
-echo "project rules" >"$WS3/AGENTS.md"
-check "recreate t3" pd recreate t3
-check "recreate keeps an existing AGENTS.md" test "$(cat "$WS3/AGENTS.md")" = "project rules"
-rm -f "$WS3/AGENTS.md"
-check "recreate re-adds a missing AGENTS.md" bash -c "'$PADDOCK' recreate t3 && grep -qF /etc/paddock/PADDOCK.md '$WS3/AGENTS.md'"
 check "rm t3" pd rm t3 --force
-rm -f "$WS3/AGENTS.md"
-check "create --no-agents-md" pd create claude t3 "$WS3" --no-agents-md
-check_not "no AGENTS.md with --no-agents-md" test -e "$WS3/AGENTS.md"
-check "recreate t3" pd recreate t3
-check_not "recreate respects --no-agents-md" test -e "$WS3/AGENTS.md"
+# Output captured first: with `| grep -q`, paddock would die of SIGPIPE
+# mid-create once grep has matched the early warning.
+out=$(pd create claude t3 "$WS3" --no-agents-md 2>&1); rc=$?
+check "create --no-agents-md still works" test "$rc" -eq 0
+check "... and warns that it is ignored" grep -q 'no longer needed' <<<"$out"
 check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
 
@@ -311,7 +316,7 @@ if ! command -v git >/dev/null; then
 else
   git -C "$WS3" init -q
   cfg_sum=$(sha256sum <"$WS3/.git/config")
-  check "create claude t3 on a git repo" pd create claude t3 "$WS3" --no-agents-md
+  check "create claude t3 on a git repo" pd create claude t3 "$WS3"
   check "start t3" pd start t3
   ax t3 git config --global user.name test >/dev/null 2>&1
   ax t3 git config --global user.email test@example.invalid >/dev/null 2>&1
@@ -328,9 +333,24 @@ else
   ax t3 touch /workspace/.git/commondir
   check "stop warns about .git/commondir" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q commondir"
   rm -f "$WS3/.git/commondir"
+  check "stop does not warn about nested repositories yet" bash -c "! '$PADDOCK' stop t3 2>&1 | grep -q 'nested git'"
+  pd start t3 >/dev/null 2>&1
+  ax t3 git -C /workspace init -q sub >/dev/null 2>&1
+  check "stop warns about a nested repository" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q 'nested git repositories.*sub/.git'"
+  rm -rf "$WS3/sub"
+  pd start t3 >/dev/null 2>&1
+  ax t3 sh -c 'mkdir -p /workspace/.git/modules/m && echo "[core]" > /workspace/.git/modules/m/config' >/dev/null 2>&1
+  check "stop warns about .git/modules" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q '.git/modules has submodule'"
+  rm -rf "$WS3/.git/modules"
   check "rm t3" pd rm t3 --force
+  git -C "$WS3" config extensions.worktreeConfig true
+  check "create claude t3 with extensions.worktreeConfig" pd create claude t3 "$WS3"
+  check "start t3" pd start t3
+  check_not "agent cannot write .git/config.worktree" ax t3 sh -c 'echo "[core] fsmonitor = x" >> /workspace/.git/config.worktree'
+  check "rm t3" pd rm t3 --force
+  git -C "$WS3" config --unset extensions.worktreeConfig
   rm -rf "$WS3/.git"
-  check "create claude t3 without a repo" pd create claude t3 "$WS3" --no-agents-md
+  check "create claude t3 without a repo" pd create claude t3 "$WS3"
   check "start t3" pd start t3
   ax t3 git -C /workspace init -q >/dev/null 2>&1
   check "start warns about an unprotected .git" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only'"
@@ -339,9 +359,28 @@ else
 fi
 rm -rf "$WS3"
 
+section "extra: protected tool settings"
+WS3=/tmp/pd-t3
+rm -rf "$WS3"; mkdir -p "$WS3"
+check "create claude t3" pd create claude t3 "$WS3"
+check ".claude created in the workspace" test -d "$WS3/.claude"
+check "start t3" pd start t3
+check_not "agent cannot write .claude/settings.json" ax t3 sh -c 'echo "{}" > /workspace/.claude/settings.json'
+check_not "agent cannot move .claude aside" ax t3 mv /workspace/.claude /workspace/.claude-old
+check "agent can write its own ~/.claude/settings.json" ax t3 sh -c 'mkdir -p ~/.claude && echo "{}" > ~/.claude/settings.json'
+check "agent can create .mcp.json (missing at create)" ax t3 sh -c 'echo "{}" > /workspace/.mcp.json'
+check "stop warns about the unprotected .mcp.json" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q '.mcp.json is not mounted read-only'"
+check "recreate protects it" bash -c "'$PADDOCK' recreate t3 >/dev/null 2>&1 && '$PADDOCK' start t3 >/dev/null 2>&1"
+check_not "agent cannot write .mcp.json after recreate" ax t3 sh -c 'echo "{}" >> /workspace/.mcp.json'
+check_not "start no longer warns" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only'"
+pd stop t3 >/dev/null 2>&1; rmdir "$WS3/.claude"
+check "start re-creates a removed .claude" bash -c "'$PADDOCK' start t3 && test -d '$WS3/.claude'"
+check "rm t3" pd rm t3 --force
+rm -rf "$WS3"
+
 section "extra: workspace path changes"
 mkdir -p /tmp/pd-t3/ws
-check "create claude t3 /tmp/pd-t3/ws" pd create claude t3 /tmp/pd-t3/ws --no-agents-md
+check "create claude t3 /tmp/pd-t3/ws" pd create claude t3 /tmp/pd-t3/ws
 mv /tmp/pd-t3/ws /tmp/pd-t3/ws2 && ln -s ws2 /tmp/pd-t3/ws
 check_not "start refuses a workspace that now resolves elsewhere" pd start t3
 check_not "recreate refuses it too" pd recreate t3
@@ -357,7 +396,7 @@ check_not "create refuses an invalid package name" pd create claude t3 "$WS3" --
 check_not "... and creates no instance" test -e "$(cfg_dir)/instances/t3"
 check_not "create with an unknown package fails" pd create claude t3 "$WS3" --packages paddock-no-such-package
 check_not "... and rolls back" test -e "$(cfg_dir)/instances/t3"
-check "create claude t3 --packages jq" pd create claude t3 "$WS3" --no-agents-md --packages jq
+check "create claude t3 --packages jq" pd create claude t3 "$WS3" --packages jq
 check "instance image built" podman image exists localhost/paddock-inst:t3
 check "start t3" pd start t3
 check "jq installed in t3" ax t3 jq --version
