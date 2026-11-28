@@ -14,4 +14,9 @@ RUN npm install -g --no-fund --no-audit --allow-scripts=@anthropic-ai/claude-cod
  && claude --version \
  && find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
 
+# The sandbox notes as Claude Code's managed instructions, which it reads in
+# every session, for every project, in addition to the project's own files.
+COPY PADDOCK.md /etc/claude-code/CLAUDE.md
+RUN chmod 0644 /etc/claude-code/CLAUDE.md
+
 LABEL paddock.image=agent paddock.tool=claude

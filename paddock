@@ -104,9 +104,12 @@ parse_kv() {
 declare -A CFG=()
 load_config() {
   parse_kv "$DATA_DIR/config" CFG new
+  # agents_md is no longer used; accepted so that old configs still load.
+  [[ -v CFG[agents_md] ]] || CFG[agents_md]=""
   [[ -f $CONFIG_DIR/config ]] && parse_kv "$CONFIG_DIR/config" CFG
+  [[ -z ${CFG[agents_md]} ]] \
+    || warn "config: agents_md is no longer used (paddock does not write AGENTS.md into workspaces); remove it from $CONFIG_DIR/config"
   [[ ${CFG[relabel]-} =~ ^[zZ]?$ ]] || die "config: relabel must be empty, 'z' or 'Z'"
-  [[ ${CFG[agents_md]-} =~ ^(yes|no)$ ]] || die "config: agents_md must be 'yes' or 'no'"
   local k
   for k in agent_pids_limit proxy_pids_limit; do
     [[ ${CFG[$k]-} =~ ^[0-9]*$ ]] || die "config: $k must be a number or empty"
@@ -601,27 +604,6 @@ wait_proxy_ready() {
   die "proxy $pc did not become ready"
 }
 
-# ------------------------------------------------------------- AGENTS.md --
-
-# Add the default AGENTS.md (it points the agent to /etc/paddock/PADDOCK.md,
-# baked into the base image) to the instance's workspace, unless the
-# workspace already has one, the instance was created with --no-agents-md,
-# or agents_md=no. Never overwrites: noclobber also covers a file that
-# appears between the check and the write.
-write_agents_md() {
-  local name=$1 dir ws src
-  dir=$(instance_dir "$name")
-  [[ ${CFG[agents_md]} == yes && ! -e $dir/no-agents-md ]] || return 0
-  ws=$(<"$dir/workspace")
-  [[ -e $ws/AGENTS.md || -L $ws/AGENTS.md ]] && return 0
-  src=$(data_file AGENTS.md) || { warn "AGENTS.md not found in $CONFIG_DIR or $DATA_DIR; none added"; return 0; }
-  if (set -C; cat -- "$src" >"$ws/AGENTS.md") 2>/dev/null; then
-    info "added $ws/AGENTS.md (points the agent to /etc/paddock/PADDOCK.md)"
-  else
-    [[ -e $ws/AGENTS.md ]] || warn "could not write $ws/AGENTS.md"
-  fi
-}
-
 # ------------------------------------------------------------------- git --
 
 # git on the host runs commands from .git/config (core.fsmonitor, core.pager,
@@ -888,10 +870,10 @@ term_env_args() {
 # --------------------------------------------------------------- commands --
 
 cmd_create() {
-  local tool="" name="" path="" domains_csv="" packages_csv="" agents_md=1
+  local tool="" name="" path="" domains_csv="" packages_csv=""
   while (($#)); do
     case $1 in
-      --no-agents-md) agents_md=0; shift ;;
+      --no-agents-md) warn "--no-agents-md is no longer needed: paddock does not write AGENTS.md into workspaces"; shift ;;
       --domains) (($# >= 2)) || die "--domains needs a value"; domains_csv=$2; shift 2 ;;
       --domains=*) domains_csv=${1#*=}; shift ;;
       --packages) (($# >= 2)) || die "--packages needs a value"; packages_csv=$2; shift 2 ;;
@@ -901,7 +883,7 @@ cmd_create() {
          elif [[ -z $path ]]; then path=$1; else die "unexpected argument '$1'"; fi; shift ;;
     esac
   done
-  [[ -n $tool && -n $name && -n $path ]] || die "usage: paddock create <tool> <name> <path> [--domains d1,d2,...] [--packages p1,p2,...] [--no-agents-md]"
+  [[ -n $tool && -n $name && -n $path ]] || die "usage: paddock create <tool> <name> <path> [--domains d1,d2,...] [--packages p1,p2,...]"
   load_tool "$tool"
   validate_name "$name"
   local dir; dir=$(instance_dir "$name")
@@ -951,14 +933,12 @@ cmd_create() {
     if ((${#domains[@]})); then printf '%s\n' "${domains[@]}" | sort -u; fi
   } | atomic_write "$dir/domains.txt" 0644
   if ((${#packages[@]})); then printf '%s\n' "${packages[@]}"; fi | write_instance_packages "$name"
-  ((agents_md)) || : | atomic_write "$dir/no-agents-md" 0644
 
   local -a pkgs; load_packages "$name" pkgs
   build_inst_image "$name" "${pkgs[@]}" || die "could not build the image for '$name' (unknown package?)"
   create_networks_and_volume "$name"
   create_containers "$name"
   trap - EXIT
-  write_agents_md "$name"
   info "created $tool instance '$name' (workspace $ws). Start it with: paddock start $name"
 }
 
@@ -993,7 +973,6 @@ cmd_recreate() {
     podman rmi "$(inst_image "$name")" >/dev/null 2>&1 || true
   fi
   rm_dangling_inst_image "$old"
-  write_agents_md "$name"
   info "recreated containers for '$name' with $(instance_image "$name") (home volume kept)"
 }
 
@@ -1504,7 +1483,6 @@ Usage: paddock <command> [args]
 
   create <tool> <name> <path> [--domains d1,d2,...]   create an instance (not started)
          [--packages p1,p2,...]                       ... with extra pacman packages
-         [--no-agents-md]                             ... without adding AGENTS.md to <path>
   start <name>                                        start proxy, then agent
   attach <name> [--yolo] [-- tool args]               run the tool in /workspace
   shell <name>                                        bash in the agent container

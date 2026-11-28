@@ -12,8 +12,8 @@ RUN pacman -Syu --noconfirm --needed \
 RUN find / -xdev -perm /6000 -type f -exec chmod ug-s {} + \
  && mkdir -p /home/agent /workspace && chmod 0777 /home/agent
 
-# Sandbox notes for the agent; the workspace AGENTS.md written by paddock
-# points here.
+# Sandbox notes for the agent. Each tool's Containerfile also copies them to
+# where the tool reads global instructions (e.g. /etc/claude-code/CLAUDE.md).
 COPY PADDOCK.md /etc/paddock/PADDOCK.md
 RUN chmod 0644 /etc/paddock/PADDOCK.md
 

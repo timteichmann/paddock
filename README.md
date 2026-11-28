@@ -119,12 +119,12 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 
 | Command | |
 | --- | --- |
-| `create <tool> <name> <path> [--domains d1,d2] [--packages p1,p2] [--no-agents-md]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths). Adds `AGENTS.md` to the workspace if missing (see [Agent instructions](#agent-instructions)) |
+| `create <tool> <name> <path> [--domains d1,d2] [--packages p1,p2]` | create (not started). The tool is fixed for the instance. Refuses some paths, see [Workspace paths](#workspace-paths) |
 | `start <name>` / `stop <name>` | idempotent; proxy first, then agent |
 | `attach <name> [--yolo] [-- tool args]` | runs the tool's command. `--yolo` adds the tool's `yolo_args` (for Claude Code `--dangerously-skip-permissions`) and prints a warning |
 | `shell <name>` | bash in the agent as the unprivileged user |
 | `rm <name> [--force]` | removes containers, networks, home volume and config. Never touches the workspace |
-| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login). Adds `AGENTS.md` to the workspace if missing |
+| `recreate <name>` | *(extra)* recreates containers, e.g. after `build` of a new version. Keeps the home volume (login) |
 | `list` | name, state, tool, number of extra domains and packages, workspace |
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
 | `packages <name> list\|add\|rm\|edit` | extra pacman packages for this instance, see [Per-instance packages](#per-instance-packages). Takes effect on `recreate` |
@@ -156,7 +156,6 @@ share/
   Containerfile.proxy
   Containerfile.base          shared base of all agent images
   PADDOCK.md                  sandbox notes for the agent, built into the base image
-  AGENTS.md                   default AGENTS.md written into workspaces
   tools/<tool>/
     tool.conf                 command, yolo_args, npm_package, protect_paths
     Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
@@ -192,8 +191,7 @@ source.
 
 `config` settings (empty value disables a limit): `agent_memory=4g`,
 `agent_cpus=2`, `agent_pids_limit=2048`, `proxy_memory=256m`, `proxy_cpus=0.5`,
-`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts), `agents_md=yes`
-(`no`: never add `AGENTS.md` to workspaces). Limit and `env` changes take effect
+`proxy_pids_limit=256`, `relabel=` (`z`/`Z` on SELinux hosts). Limit and `env` changes take effect
 on `paddock recreate <name>`.
 
 ### Per-instance packages
@@ -238,17 +236,21 @@ exact `paddock domains <instance> add ...` or `paddock packages <instance> add .
 command.
 The instance name comes from `$PADDOCK_INSTANCE`.
 
-So that agents read it, `create` and `recreate` write a short `AGENTS.md` into
-the workspace that points to that file. Claude Code and other agents read
-`AGENTS.md` automatically. paddock never overwrites an existing `AGENTS.md`;
-if your project already has one, add a reference to `/etc/paddock/PADDOCK.md`
-yourself if you want it. Skip it per instance with `create --no-agents-md` or
-for all instances with `agents_md=no` in `config`.
+So that the agent reads it in every session, each tool's image also has it
+where the tool looks for global instructions; for Claude Code that is
+`/etc/claude-code/CLAUDE.md`, its managed instructions file. It is read in
+addition to the project's own `CLAUDE.md`/`AGENTS.md`, owned by root and so
+read-only for the agent, and nothing is written into your workspace.
 
-Both files can be overridden in the config dir (`PADDOCK.md`, `AGENTS.md`). A
-changed `PADDOCK.md` takes effect after `paddock build <tool>` and
-`paddock recreate <name>`; if you override `Containerfile.base`, keep its
-`COPY PADDOCK.md` line.
+`PADDOCK.md` can be overridden in the config dir. A changed `PADDOCK.md` takes
+effect after `paddock build <tool>` and `paddock recreate <name>`; if you
+override `Containerfile.base` or a tool's `Containerfile`, keep their
+`COPY PADDOCK.md` lines.
+
+Earlier versions wrote an `AGENTS.md` pointing to `/etc/paddock/PADDOCK.md`
+into workspaces. paddock leaves such files alone; delete them if you no
+longer want them. `create --no-agents-md` and the `agents_md` setting are
+ignored with a warning.
 
 ### Workspace paths
 

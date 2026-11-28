@@ -280,26 +280,18 @@ check "start t3" pd start t3
 check "recreate t3 keeps working" bash -c "'$PADDOCK' recreate t3 && '$PADDOCK' start t3"
 check "rm t3" pd rm t3 --force
 
-section "extra: AGENTS.md and PADDOCK.md"
+section "extra: agent instructions (PADDOCK.md)"
 WS3=/tmp/pd-t3
 rm -rf "$WS3"
 check "create claude t3 $WS3" pd create claude t3 "$WS3"
-check "AGENTS.md added to a workspace without one" grep -qF /etc/paddock/PADDOCK.md "$WS3/AGENTS.md"
-check "AGENTS.md owned by host user" test "$(stat -c %u "$WS3/AGENTS.md" 2>/dev/null)" = "$(id -u)"
+check_not "no AGENTS.md written into the workspace" test -e "$WS3/AGENTS.md"
 check "start t3" pd start t3
 check "PADDOCK.md readable in the agent" ax t3 grep -qF 'paddock domains' /etc/paddock/PADDOCK.md
+check "Claude Code's managed CLAUDE.md is PADDOCK.md" ax t3 sh -c 'test "$(sha256sum </etc/paddock/PADDOCK.md)" = "$(sha256sum </etc/claude-code/CLAUDE.md)"'
+check_not "agent cannot change it" ax t3 sh -c 'echo x >> /etc/claude-code/CLAUDE.md'
 check "PADDOCK_INSTANCE is set in the agent" test "$(ax t3 printenv PADDOCK_INSTANCE)" = t3
-echo "project rules" >"$WS3/AGENTS.md"
-check "recreate t3" pd recreate t3
-check "recreate keeps an existing AGENTS.md" test "$(cat "$WS3/AGENTS.md")" = "project rules"
-rm -f "$WS3/AGENTS.md"
-check "recreate re-adds a missing AGENTS.md" bash -c "'$PADDOCK' recreate t3 && grep -qF /etc/paddock/PADDOCK.md '$WS3/AGENTS.md'"
 check "rm t3" pd rm t3 --force
-rm -f "$WS3/AGENTS.md"
-check "create --no-agents-md" pd create claude t3 "$WS3" --no-agents-md
-check_not "no AGENTS.md with --no-agents-md" test -e "$WS3/AGENTS.md"
-check "recreate t3" pd recreate t3
-check_not "recreate respects --no-agents-md" test -e "$WS3/AGENTS.md"
+check "create --no-agents-md still works (ignored, warns)" bash -c "'$PADDOCK' create claude t3 '$WS3' --no-agents-md 2>&1 | grep -q 'no longer needed'"
 check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
 
@@ -311,7 +303,7 @@ if ! command -v git >/dev/null; then
 else
   git -C "$WS3" init -q
   cfg_sum=$(sha256sum <"$WS3/.git/config")
-  check "create claude t3 on a git repo" pd create claude t3 "$WS3" --no-agents-md
+  check "create claude t3 on a git repo" pd create claude t3 "$WS3"
   check "start t3" pd start t3
   ax t3 git config --global user.name test >/dev/null 2>&1
   ax t3 git config --global user.email test@example.invalid >/dev/null 2>&1
@@ -339,13 +331,13 @@ else
   rm -rf "$WS3/.git/modules"
   check "rm t3" pd rm t3 --force
   git -C "$WS3" config extensions.worktreeConfig true
-  check "create claude t3 with extensions.worktreeConfig" pd create claude t3 "$WS3" --no-agents-md
+  check "create claude t3 with extensions.worktreeConfig" pd create claude t3 "$WS3"
   check "start t3" pd start t3
   check_not "agent cannot write .git/config.worktree" ax t3 sh -c 'echo "[core] fsmonitor = x" >> /workspace/.git/config.worktree'
   check "rm t3" pd rm t3 --force
   git -C "$WS3" config --unset extensions.worktreeConfig
   rm -rf "$WS3/.git"
-  check "create claude t3 without a repo" pd create claude t3 "$WS3" --no-agents-md
+  check "create claude t3 without a repo" pd create claude t3 "$WS3"
   check "start t3" pd start t3
   ax t3 git -C /workspace init -q >/dev/null 2>&1
   check "start warns about an unprotected .git" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only'"
@@ -357,7 +349,7 @@ rm -rf "$WS3"
 section "extra: protected tool settings"
 WS3=/tmp/pd-t3
 rm -rf "$WS3"; mkdir -p "$WS3"
-check "create claude t3" pd create claude t3 "$WS3" --no-agents-md
+check "create claude t3" pd create claude t3 "$WS3"
 check ".claude created in the workspace" test -d "$WS3/.claude"
 check "start t3" pd start t3
 check_not "agent cannot write .claude/settings.json" ax t3 sh -c 'echo "{}" > /workspace/.claude/settings.json'
@@ -375,7 +367,7 @@ rm -rf "$WS3"
 
 section "extra: workspace path changes"
 mkdir -p /tmp/pd-t3/ws
-check "create claude t3 /tmp/pd-t3/ws" pd create claude t3 /tmp/pd-t3/ws --no-agents-md
+check "create claude t3 /tmp/pd-t3/ws" pd create claude t3 /tmp/pd-t3/ws
 mv /tmp/pd-t3/ws /tmp/pd-t3/ws2 && ln -s ws2 /tmp/pd-t3/ws
 check_not "start refuses a workspace that now resolves elsewhere" pd start t3
 check_not "recreate refuses it too" pd recreate t3
@@ -391,7 +383,7 @@ check_not "create refuses an invalid package name" pd create claude t3 "$WS3" --
 check_not "... and creates no instance" test -e "$(cfg_dir)/instances/t3"
 check_not "create with an unknown package fails" pd create claude t3 "$WS3" --packages paddock-no-such-package
 check_not "... and rolls back" test -e "$(cfg_dir)/instances/t3"
-check "create claude t3 --packages jq" pd create claude t3 "$WS3" --no-agents-md --packages jq
+check "create claude t3 --packages jq" pd create claude t3 "$WS3" --packages jq
 check "instance image built" podman image exists localhost/paddock-inst:t3
 check "start t3" pd start t3
 check "jq installed in t3" ax t3 jq --version
