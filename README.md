@@ -349,7 +349,8 @@ Code `.claude/` and `.mcp.json`.
 - **Network:** the agent is only on `pd-<n>-int` (`--internal`, no gateway, no
   default route, `--disable-dns`, `--dns=none`). It reaches the proxy through a
   static `/etc/hosts` entry, so DNS tunnelling is not available either. Programs
-  that ignore `HTTPS_PROXY` simply fail.
+  that ignore `HTTPS_PROXY` simply fail. `NODE_USE_ENV_PROXY=1` is set so that
+  Node's built-in `fetch` uses the proxy too.
 - **Proxy:** Squid listens only on its internal-network address. Policy is
   default deny: source must be the instance's subnet; host must be allowlisted
   (`dstdomain -n`, no reverse DNS); `CONNECT` only to 443; plain HTTP only to

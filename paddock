@@ -810,6 +810,7 @@ create_containers() {
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
     -e HTTP_PROXY="$purl"  -e http_proxy="$purl" \
     -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
+    -e NODE_USE_ENV_PROXY=1 \
     "${tenv[@]}" \
     -e PADDOCK_INSTANCE="$name" -e PADDOCK_TOOL="$tool" \
     "$img" sleep infinity >/dev/null

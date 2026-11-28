@@ -144,6 +144,8 @@ check "list shows $T1 running" bash -c "'$PADDOCK' list | awk '\$1==\"$T1\" {pri
 section "2. allowlist enforced by the proxy"
 check "https://api.anthropic.com gets an HTTP response" got_response "$T1" https://api.anthropic.com
 check "https://$DENIED is denied by the proxy (403)" proxy_denied "$T1" "https://$DENIED"
+check "node fetch() goes through the proxy" \
+  ax "$T1" node -e "fetch('https://api.anthropic.com').then(() => process.exit(0), () => process.exit(1))"
 check "plain http://$DENIED is denied (403)" test "$(http_code "$T1" "http://$DENIED")" = 403
 check "allowlisted domain on a non-443 port is denied" proxy_denied "$T1" https://api.anthropic.com:8443
 check "proxy log records the denial" test "$(verdict "$T1" "$DENIED")" = DENIED
