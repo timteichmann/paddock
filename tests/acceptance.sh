@@ -226,8 +226,8 @@ check_not "no git credentials or forge URL rewrites in the agent" \
   bash -c "podman exec pd-$T1-agent git config --show-origin --list 2>/dev/null | grep -qiE 'credential|insteadof'"
 check_not "paddock config dir not mounted" \
   bash -c "podman exec pd-$T1-agent cat /proc/self/mountinfo | grep -qF '$(cfg_dir)'"
-check "workspace is the only host directory bind-mounted" \
-  bash -c "podman inspect --format '{{range .Mounts}}{{.Type}}={{.Source}}{{\"\\n\"}}{{end}}' pd-$T1-agent | grep '^bind=' | grep -vxF 'bind=$WS1' | grep -vE '^bind=.*/(userdata|containers/storage)/' | grep -q . && exit 1 || exit 0"
+check "only the workspace (and paths in it) is bind-mounted" \
+  bash -c "podman inspect --format '{{range .Mounts}}{{.Type}}={{.Source}}{{\"\\n\"}}{{end}}' pd-$T1-agent | grep '^bind=' | grep -vxF 'bind=$WS1' | grep -vF 'bind=$WS1/' | grep -vE '^bind=.*/(userdata|containers/storage)/' | grep -q . && exit 1 || exit 0"
 
 section "8. two concurrent instances"
 check "create claude $T2 $WS2 --domains $DOMAIN2" pd create claude "$T2" "$WS2" --domains "$DOMAIN2"
@@ -352,6 +352,25 @@ else
   check "recreate protects it" bash -c "'$PADDOCK' recreate t3 >/dev/null 2>&1 && ! '$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only' && ! podman exec pd-t3-agent touch /workspace/.git/hooks/x"
   check "rm t3" pd rm t3 --force
 fi
+rm -rf "$WS3"
+
+section "extra: protected tool settings"
+WS3=/tmp/pd-t3
+rm -rf "$WS3"; mkdir -p "$WS3"
+check "create claude t3" pd create claude t3 "$WS3" --no-agents-md
+check ".claude created in the workspace" test -d "$WS3/.claude"
+check "start t3" pd start t3
+check_not "agent cannot write .claude/settings.json" ax t3 sh -c 'echo "{}" > /workspace/.claude/settings.json'
+check_not "agent cannot move .claude aside" ax t3 mv /workspace/.claude /workspace/.claude-old
+check "agent can write its own ~/.claude/settings.json" ax t3 sh -c 'mkdir -p ~/.claude && echo "{}" > ~/.claude/settings.json'
+check "agent can create .mcp.json (missing at create)" ax t3 sh -c 'echo "{}" > /workspace/.mcp.json'
+check "stop warns about the unprotected .mcp.json" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q '.mcp.json is not mounted read-only'"
+check "recreate protects it" bash -c "'$PADDOCK' recreate t3 >/dev/null 2>&1 && '$PADDOCK' start t3 >/dev/null 2>&1"
+check_not "agent cannot write .mcp.json after recreate" ax t3 sh -c 'echo "{}" >> /workspace/.mcp.json'
+check_not "start no longer warns" bash -c "'$PADDOCK' start t3 2>&1 | grep -q 'not mounted read-only'"
+pd stop t3 >/dev/null 2>&1; rmdir "$WS3/.claude"
+check "start re-creates a removed .claude" bash -c "'$PADDOCK' start t3 && test -d '$WS3/.claude'"
+check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
 
 section "extra: workspace path changes"

@@ -158,7 +158,7 @@ share/
   PADDOCK.md                  sandbox notes for the agent, built into the base image
   AGENTS.md                   default AGENTS.md written into workspaces
   tools/<tool>/
-    tool.conf                 command, yolo_args, npm_package
+    tool.conf                 command, yolo_args, npm_package, protect_paths
     Containerfile             FROM paddock-base; installs the tool (build arg TOOL_VERSION)
     domains.txt               domains every instance of this tool may reach
     env                       environment set in the agent container (KEY=VALUE)
@@ -309,10 +309,35 @@ When you see such a warning:
 - `git -c diff.ignoreSubmodules=all status` and `... diff` do not run git in
   submodules; `git add` still does.
 
+### Tool settings in the workspace
+
+Coding agents read settings from the project, and some of them run commands:
+Claude Code runs hooks from `.claude/settings.json` and
+`.claude/settings.local.json`, and MCP servers from `.mcp.json`. If you also run
+the tool on the host in the same directory, settings the agent wrote there
+would run with your full permissions. So paddock mounts the tool's
+`protect_paths` (from its `tool.conf`) read-only in the instance; for Claude
+Code `.claude/` and `.mcp.json`.
+
+- A directory entry (trailing `/`, e.g. `.claude/`) is created in the
+  workspace if it is missing, so it is protected from the start. A file entry
+  (e.g. `.mcp.json`) is only protected if it exists when the containers are
+  created; if it appears later, `start` and `stop` warn until you check it and
+  run `paddock recreate <name>`.
+- The agent in the instance cannot change these settings either. Claude Code
+  there stores permission rules you allow with "don't ask again" in
+  `~/.claude/settings.json` in the instance's home volume. To change the
+  project's settings, edit them on the host and run `paddock recreate <name>`.
+- Entries are single names directly in the workspace. Instructions such as
+  `CLAUDE.md` stay writable: they cannot run commands, but review changes to
+  them like any other file.
+
 ## How isolation works
 
 - **Filesystem:** only the workspace is bind-mounted (`/workspace`), with
-  `.git/config` and `.git/hooks` read-only (see [Git](#git)). Home is a
+  `.git/config` and `.git/hooks` read-only (see [Git](#git)), and the tool's
+  project settings read-only (see
+  [Tool settings in the workspace](#tool-settings-in-the-workspace)). Home is a
   per-instance named volume, so one instance cannot plant hooks or settings in
   another. No host sockets, no `$HOME`, no host credentials.
 - **Ownership:** `--userns=keep-id --user $UID:$GID`. Files created by the agent

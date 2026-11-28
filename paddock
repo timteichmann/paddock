@@ -150,9 +150,16 @@ load_tool() {
   [[ $t =~ $NAME_RE && $t != base && $t != proxy && $t != inst ]] || die "invalid tool name '$t'"
   f=$(data_file "tools/$t/tool.conf") \
     || die "unknown tool '$t' (available: $(list_tools | paste -sd' '))"
-  TOOL=([command]="" [yolo_args]="" [npm_package]="")
+  TOOL=([command]="" [yolo_args]="" [npm_package]="" [protect_paths]="")
   parse_kv "$f" TOOL
   [[ -n ${TOOL[command]} ]] || die "$f: command is required"
+  local p
+  for p in ${TOOL[protect_paths]}; do
+    # One top-level name: a mount point cannot be renamed, but the agent could
+    # rename a parent directory of a deeper one and put its own in place.
+    [[ $p =~ ^[A-Za-z0-9._-]+/?$ && ${p%/} != . && ${p%/} != .. && ${p%/} != .git ]] \
+      || die "$f: invalid protect_paths entry '$p' (a file or dir/ directly in the workspace, not .git)"
+  done
   TOOL[name]=$t
 }
 
@@ -665,6 +672,56 @@ nested_git_dirs() {
     | grep -vxF .git | awk 'NR <= 5 { print; next } { print "..."; exit }' || true
 }
 
+# --------------------------------------------------------- protected paths --
+
+# The tool's protect_paths (tool.conf) are files and directories in the
+# workspace that the tool run on the host reads and may run commands from,
+# e.g. hooks in Claude Code's .claude/settings.json. They are mounted
+# read-only in the agent. An entry with a trailing / is a directory, created
+# if missing; a file entry is protected only if it exists. Needs load_tool.
+
+# Prints -v arguments for the protected paths of workspace $1.
+protect_mount_args() { # ws
+  local ws=$1 e p
+  for e in ${TOOL[protect_paths]}; do
+    p=${e%/}
+    if [[ -L $ws/$p ]]; then
+      warn "$ws/$p is a symlink; it is not protected"; continue
+    fi
+    if [[ ! -e $ws/$p ]]; then
+      [[ $e == */ ]] || continue
+      mkdir -- "$ws/$p"
+    fi
+    printf -- '-v\n%s:/workspace/%s:%s\n' "$ws/$p" "$p" "$(mount_opt ro,bind)"
+  done
+}
+
+# Names (comma-separated) of the protected paths among -v arguments on stdin.
+protected_names() {
+  sed -n 's|^.*:/workspace/\([^/:]*\):.*$|\1|p' | grep -vxF .git | paste -sd, || true
+}
+
+# Before instance $1's agent starts: re-create missing protected directories
+# (podman cannot start with a missing bind source) and refuse a missing file.
+# Warn about protected paths that exist but are not mounted read-only. With
+# $3 = warn-only (stop), only warn.
+protect_check() { # name ws [warn-only]
+  local name=$1 ws=$2 mode=${3-} e p label
+  label=$(podman container inspect --format '{{index .Config.Labels "paddock.protected"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
+  for e in ${TOOL[protect_paths]}; do
+    p=${e%/}
+    if [[ ,$label, == *",$p,"* ]]; then
+      if [[ ! -e $ws/$p && ! -L $ws/$p && $mode != warn-only ]]; then
+        [[ $e == */ ]] || die "$ws/$p was removed; run 'paddock recreate $name'"
+        mkdir -- "$ws/$p"
+      fi
+    elif [[ -e $ws/$p || -L $ws/$p ]]; then
+      warn "$ws/$p is not mounted read-only in '$name' (created after the instance?); ${TOOL[command]} on the host may run commands from it. Check it, then run 'paddock recreate $name' to protect it"
+    fi
+  done
+  return 0
+}
+
 # Warnings about git state in workspace $2 that the mounts cannot cover: git
 # on the host would run commands configured there (core.fsmonitor, hooks, ...).
 git_warnings() { # name ws
@@ -743,6 +800,10 @@ create_containers() {
   local -a tenv=() gitv=()
   if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
   mapfile -t gitv < <(git_mount_args "$ws")
+  local -a protv=()
+  load_tool "$tool"
+  mapfile -t protv < <(protect_mount_args "$ws")
+  protv+=(--label "paddock.protected=$(printf '%s\n' "${protv[@]}" | protected_names)")
   ((${#gitv[@]})) && gitv+=(--label paddock.git=protected)
   [[ " ${gitv[*]} " == *":/workspace/.git/config.worktree:"* ]] && gitv+=(--label paddock.git-worktree-config=protected)
   local purl
@@ -758,6 +819,7 @@ create_containers() {
     -v "$(home_vol "$name"):/home/agent:U" \
     -v "$ws:/workspace:$(mount_opt bind)" \
     "${gitv[@]}" \
+    "${protv[@]}" \
     -w /workspace \
     -e HOME=/home/agent \
     -e HTTPS_PROXY="$purl" -e https_proxy="$purl" \
@@ -784,6 +846,8 @@ start_instance() {
   { ctr_exists "$pc" && ctr_exists "$ac"; } || die "containers for '$name' are missing; run 'paddock recreate $name'"
   local ws; ws=$(verify_workspace "$name")
   git_warnings "$name" "$ws"
+  load_tool "$(instance_tool "$name")"
+  protect_check "$name" "$ws"
   packages_warning "$name"
   if ! ctr_running "$pc"; then
     generate_proxy_config "$name"
@@ -946,7 +1010,12 @@ cmd_stop() {
   for c in "$(agent_ctr "$name")" "$(proxy_ctr "$name")"; do
     ctr_exists "$c" && podman stop -t 5 "$c" >/dev/null
   done
-  [[ -f $(instance_dir "$name")/workspace ]] && git_warnings "$name" "$(<"$(instance_dir "$name")/workspace")"
+  if [[ -f $(instance_dir "$name")/workspace ]]; then
+    local ws; ws=$(<"$(instance_dir "$name")/workspace")
+    git_warnings "$name" "$ws"
+    load_tool "$(instance_tool "$name")"
+    protect_check "$name" "$ws" warn-only
+  fi
   info "instance '$name' stopped"
 }
 
