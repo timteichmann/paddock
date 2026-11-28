@@ -129,7 +129,7 @@ trap cleanup EXIT
 CREATED_WS1=1 CREATED_WS2=1
 
 # ---------------------------------------------------------------- tests --
-section "11. runs as a normal user (checked up front)"
+section "preflight: runs as a normal user (spec test 11)"
 check_not "not running as root (EUID=$EUID)" test "$EUID" -eq 0
 check "podman is rootless" test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
 # Quoted strings are dropped first: `paddock doctor` prints "sudo ..." fix hints.
