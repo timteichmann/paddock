@@ -51,7 +51,9 @@ All images are built from `archlinux:latest`, whatever distro the host runs:
 Claude Code runs with `DISABLE_AUTOUPDATER=1` and
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry, error reporting
 or update checks), so only the allowlisted API and login hosts are contacted.
-Arch is rolling, so a rebuild picks up current packages.
+Arch is rolling, but podman reuses cached layers until the `archlinux:latest`
+image itself changes; `paddock build <tool> --refresh` rebuilds every layer
+with current packages. Run `paddock recreate <name>` afterwards.
 
 ## Install
 
@@ -129,7 +131,7 @@ own home volume `pd-web-home` and survives `stop`/`start` and `recreate`
 | `domains <name> list\|add\|rm\|edit` | live reload via `squid -k reconfigure`, no restarts |
 | `packages <name> list\|add\|rm\|edit` | extra pacman packages for this instance, see [Per-instance packages](#per-instance-packages). Takes effect on `recreate` |
 | `logs <name> [-f] [-n N] [--raw]` | `TIME ALLOWED/DENIED METHOD host:port (squid-code status)` |
-| `build <tool> [--version X]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned |
+| `build <tool> [--version X] [--refresh]` | builds proxy, base and tool image. Without `--version`, the latest version of the tool's npm package is resolved and pinned. `--refresh` rebuilds without the layer cache, to pick up current Arch packages |
 | `tools` | available tools, their built version and where their definition comes from |
 | `purge [--force] [--keep-images]` | removes everything paddock created for your user: all instances (containers, networks, home volumes incl. logins, also ones whose config is gone), the `localhost/paddock-*` images and the config dir (`--keep-images` keeps the proxy, base and tool images; instance images go with their instance). Lists it all and asks first. Never touches workspaces. Run it before uninstalling |
 | `doctor` | checks the host (Podman version, rootless, netavark, subuid/subgid, cgroup delegation, SELinux relabel) and prints distro-specific fixes. Exits non-zero if something required is missing |

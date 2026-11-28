@@ -102,7 +102,7 @@ _paddock() {
              | grep -vxF -f <(printf '%s\n' "${args[@]:2}") ) ;;
       esac ;;
     build)
-      opts="--version"
+      opts="--version --refresh"
       ((n == 1)) && list=$(_paddock_tools) ;;
     purge)
       opts="--force --keep-images" ;;

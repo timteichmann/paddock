@@ -195,6 +195,13 @@ check_not "domains add rejects an IP" pd domains "$T1" add 1.2.3.4
 check_not "domains add rejects a URL" pd domains "$T1" add https://example.net/x
 check_not "domains add rejects a port" pd domains "$T1" add example.net:443
 check_not "domains add rejects a glob" pd domains "$T1" add '*.example.net'
+printf 'a.example.net b.example.net # two on a line\n' >>"$(cfg_dir)/instances/$T1/domains.txt"
+check "domains on one line are read as separate entries" \
+  bash -c "'$PADDOCK' domains $T1 list | grep -qE '^instance +a\.example\.net$' && '$PADDOCK' domains $T1 list | grep -qE '^instance +b\.example\.net$'"
+pd domains "$T1" rm a.example.net b.example.net >/dev/null 2>&1
+check_not "logs -n 0 is refused" pd logs "$T1" -n 0
+check_not "logs -n x is refused" pd logs "$T1" -n x
+check "logs -n 1 prints one line" test "$(pd logs "$T1" -n 1 | wc -l)" -eq 1
 
 section "6. workspace ownership"
 check "agent creates /workspace/from-agent" ax "$T1" sh -c 'echo agent > /workspace/from-agent'

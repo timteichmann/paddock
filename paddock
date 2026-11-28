@@ -188,21 +188,24 @@ normalize_domain() {
   printf '%s' "$d"
 }
 
-# Print validated domains from a file (comments/blank lines ignored).
+# Print validated domains from a file (comments/blank lines ignored; several
+# domains on a line are separated by whitespace), one per line.
 read_domains() {
-  local f=$1 line n=0 d
+  local f=$1 line n=0 w d
+  local -a words
   [[ -f $f ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     line="${line%%#*}"
-    line="${line//[[:space:]]/}"
-    [[ -z $line ]] && continue
-    d=${line,,}
-    if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
-      printf 'paddock: error: %s:%d: invalid domain %q\n' "$f" "$n" "$line" >&2
-      return 1
-    fi
-    printf '%s\n' "$d"
+    read -r -a words <<<"$line"   # no glob expansion, unlike an unquoted $line
+    for w in "${words[@]}"; do
+      d=${w,,}
+      if [[ ${#d} -gt 254 || ! $d =~ $DOMAIN_RE ]]; then
+        printf 'paddock: error: %s:%d: invalid domain %q\n' "$f" "$n" "$w" >&2
+        return 1
+      fi
+      printf '%s\n' "$d"
+    done
   done <"$f"
 }
 
@@ -1217,11 +1220,13 @@ cmd_logs() {
       -f|--follow) follow=1; shift ;;
       --raw) raw=1; shift ;;
       -n|--tail) (($# >= 2)) || die "$1 needs a value"; tail=$2; shift 2 ;;
+      --tail=*) tail=${1#*=}; shift ;;
       -*) die "unknown option '$1'" ;;
       *) [[ -z $name ]] || die "unexpected argument '$1'"; name=$1; shift ;;
     esac
   done
   [[ -n $name ]] || die "usage: paddock logs <name> [-f] [-n N] [--raw]"
+  [[ -z $tail || $tail =~ ^[1-9][0-9]{0,8}$ ]] || die "-n needs a positive number, not '$tail'"
   require_instance "$name"
   local pc; pc=$(proxy_ctr "$name")
   ctr_exists "$pc" || die "proxy container $pc does not exist"
@@ -1241,16 +1246,17 @@ cmd_logs() {
 }
 
 cmd_build() {
-  local tool="" version=""
+  local tool="" version="" refresh=0
   while (($#)); do
     case $1 in
+      --refresh) refresh=1; shift ;;
       --version) (($# >= 2)) || die "--version needs a value"; version=$2; shift 2 ;;
       --version=*) version=${1#*=}; shift ;;
       -*) die "unknown option '$1'" ;;
       *) [[ -z $tool ]] || die "unexpected argument '$1'"; tool=$1; shift ;;
     esac
   done
-  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] (tools: $(list_tools | paste -sd' '))"
+  [[ -n $tool ]] || die "usage: paddock build <tool> [--version X] [--refresh] (tools: $(list_tools | paste -sd' '))"
   load_tool "$tool"
   if [[ -z $version ]]; then
     [[ -n ${TOOL[npm_package]} ]] || die "tool '$tool' has no npm_package to resolve the latest version from; pass --version X"
@@ -1273,19 +1279,25 @@ cmd_build() {
     cp "$src" "$ctx/${f//\//_}"
   done
 
+  # Cached layers keep the packages of their first build until the Arch image
+  # itself changes; --refresh rebuilds every layer to get current packages.
+  local -a nocache=()
+  ((refresh)) && nocache=(--no-cache)
   local img="$AGENT_IMAGE_PREFIX$tool:$version"
   info "building $PROXY_IMAGE"
-  podman build --pull=newer -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
+  podman build --pull=newer "${nocache[@]}" -t "$PROXY_IMAGE" -f "$ctx/Containerfile.proxy" "$ctx"
   info "building $BASE_IMAGE"
-  podman build --pull=newer -t "$BASE_IMAGE" -f "$ctx/Containerfile.base" "$ctx"
+  podman build --pull=newer "${nocache[@]}" -t "$BASE_IMAGE" -f "$ctx/Containerfile.base" "$ctx"
   info "building $img"
-  podman build --pull=never -t "$img" --build-arg "PADDOCK_BASE=$BASE_IMAGE" \
+  podman build --pull=never "${nocache[@]}" -t "$img" --build-arg "PADDOCK_BASE=$BASE_IMAGE" \
     --build-arg "TOOL_VERSION=$version" -f "$ctx/tools_${tool}_Containerfile" "$ctx"
   local old; old=$(tool_version "$tool")
   set_tool_version "$tool" "$version"
   info "$tool image is now $img"
   if [[ -n $old && $old != "$version" ]] && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
     info "existing $tool instances still use $AGENT_IMAGE_PREFIX$tool:$old; run 'paddock recreate <name>' to switch (login is kept)"
+  elif ((refresh)) && grep -qsxF "$tool" "$INSTANCES_DIR"/*/tool; then
+    info "existing $tool instances keep the previous image until 'paddock recreate <name>' (login is kept)"
   fi
 }
 
@@ -1493,7 +1505,7 @@ Usage: paddock <command> [args]
   domains <name> list|add|rm|edit [domain...]         manage the instance allowlist
   packages <name> list|add|rm|edit [package...]       manage the instance's extra packages
   logs <name> [-f] [-n N] [--raw]                     proxy log of allowed/denied requests
-  build <tool> [--version X]                          build proxy, base and tool images
+  build <tool> [--version X] [--refresh]              build proxy, base and tool images
   tools                                               list available tools
   doctor                                              check that this host can run paddock
   purge [--force] [--keep-images]                     remove all instances, images and config
