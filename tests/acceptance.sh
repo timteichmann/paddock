@@ -328,7 +328,22 @@ else
   ax t3 touch /workspace/.git/commondir
   check "stop warns about .git/commondir" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q commondir"
   rm -f "$WS3/.git/commondir"
+  check "stop does not warn about nested repositories yet" bash -c "! '$PADDOCK' stop t3 2>&1 | grep -q 'nested git'"
+  pd start t3 >/dev/null 2>&1
+  ax t3 git -C /workspace init -q sub >/dev/null 2>&1
+  check "stop warns about a nested repository" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q 'nested git repositories.*sub/.git'"
+  rm -rf "$WS3/sub"
+  pd start t3 >/dev/null 2>&1
+  ax t3 sh -c 'mkdir -p /workspace/.git/modules/m && echo "[core]" > /workspace/.git/modules/m/config' >/dev/null 2>&1
+  check "stop warns about .git/modules" bash -c "'$PADDOCK' stop t3 2>&1 | grep -q '.git/modules has submodule'"
+  rm -rf "$WS3/.git/modules"
   check "rm t3" pd rm t3 --force
+  git -C "$WS3" config extensions.worktreeConfig true
+  check "create claude t3 with extensions.worktreeConfig" pd create claude t3 "$WS3" --no-agents-md
+  check "start t3" pd start t3
+  check_not "agent cannot write .git/config.worktree" ax t3 sh -c 'echo "[core] fsmonitor = x" >> /workspace/.git/config.worktree'
+  check "rm t3" pd rm t3 --force
+  git -C "$WS3" config --unset extensions.worktreeConfig
   rm -rf "$WS3/.git"
   check "create claude t3 without a repo" pd create claude t3 "$WS3" --no-agents-md
   check "start t3" pd start t3

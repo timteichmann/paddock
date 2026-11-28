@@ -289,7 +289,25 @@ mounted read-only as a whole.
   warn when it exists.
 - Changes you make to `.git/config` on the host (e.g. `git remote add`) are
   visible in the instance after `paddock recreate <name>`.
-- Repositories in subdirectories of the workspace are not protected.
+- With `extensions.worktreeConfig` set, `.git/config.worktree` is mounted
+  read-only as well (created empty if missing).
+
+**Nested repositories are not protected.** The agent can create a repository
+in a subdirectory (or change a submodule's `.git` file or `.git/modules/*`)
+and set its `core.fsmonitor` or hooks. If the workspace's index lists it as a
+submodule, which the agent can also arrange, `git status`, `git diff` or
+`git add` in the workspace on the host runs git in it with that config. The
+same applies to linked worktrees (`.git/worktrees/*`). paddock cannot prevent
+this without taking `.git` away from the agent, so `start` and `stop` warn
+when the workspace has nested repositories, submodule repositories in
+`.git/modules`, or a linked worktree whose `commondir` points elsewhere.
+When you see such a warning:
+
+- remove nested repositories you did not create yourself, and check the
+  config and hooks of the others (`<dir>/.git/config`, `<dir>/.git/hooks`)
+  before running git in the workspace;
+- `git -c diff.ignoreSubmodules=all status` and `... diff` do not run git in
+  submodules; `git add` still does.
 
 ## How isolation works
 

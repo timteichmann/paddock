@@ -638,20 +638,72 @@ git_mount_args() { # ws
     printf -- '-v\n%s:/workspace/.git:%s\n' "$g" "$(mount_opt bind)"
     printf -- '-v\n%s:/workspace/.git/config:%s\n' "$g/config" "$(mount_opt ro,bind)"
     printf -- '-v\n%s:/workspace/.git/hooks:%s\n' "$g/hooks" "$(mount_opt ro,bind)"
+    # With extensions.worktreeConfig, git also reads .git/config.worktree.
+    if git_worktree_config "$g"; then
+      if [[ -L $g/config.worktree ]]; then
+        warn "$g/config.worktree is a symlink; it is not protected"
+      else
+        [[ -e $g/config.worktree ]] || : >"$g/config.worktree"
+        printf -- '-v\n%s:/workspace/.git/config.worktree:%s\n' "$g/config.worktree" "$(mount_opt ro,bind)"
+      fi
+    fi
   fi
 }
 
-# Warnings about the workspace's .git that the mounts cannot cover.
+# True if the repository config $1/config enables extensions.worktreeConfig.
+# Parsed with grep: running host git on the workspace is what we guard against.
+git_worktree_config() {
+  grep -qiE '^[[:space:]]*worktreeconfig[[:space:]]*=[[:space:]]*(true|yes|on|1)[[:space:]]*$' "$1/config" 2>/dev/null
+}
+
+# Up to 5 nested .git entries (directories or files) below workspace $1,
+# relative to it; a 6th line "..." if there are more. The top-level .git is
+# skipped, and so is what lies inside any .git.
+nested_git_dirs() {
+  local ws=$1
+  find "$ws" -mindepth 1 -name .git -prune -printf '%P\n' 2>/dev/null \
+    | grep -vxF .git | awk 'NR <= 5 { print; next } { print "..."; exit }' || true
+}
+
+# Warnings about git state in workspace $2 that the mounts cannot cover: git
+# on the host would run commands configured there (core.fsmonitor, hooks, ...).
 git_warnings() { # name ws
-  local name=$1 g="$2/.git" label
+  local name=$1 ws=$2 g="$2/.git" label d nested
+  # Nested repositories (also submodule checkouts, whose .git is a file the
+  # agent can point anywhere). `git status` or `git add` in the workspace runs
+  # git in each submodule the index lists, with that repository's config.
+  nested=$(nested_git_dirs "$ws" | paste -sd' ')
+  if [[ -n $nested ]]; then
+    warn "nested git repositories in $ws ($nested): their config and hooks are writable by the agent, and git on the host runs them, also from 'git status' in $ws. See 'Git' in the paddock README before using git there"
+  fi
   [[ -e $g || -L $g ]] || return 0
   label=$(podman container inspect --format '{{index .Config.Labels "paddock.git"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
   if [[ $label != protected ]]; then
     warn "$g is not mounted read-only in '$name' (created after the instance?); run 'paddock recreate $name' to protect it"
   fi
+  [[ -d $g ]] || return 0
   # git reads config and hooks from the directory named in commondir.
   if [[ -e $g/commondir ]]; then
     warn "$g/commondir exists; git on the host reads config and hooks from the directory it names. Check it before using git there"
+  fi
+  # Submodule repositories keep their own config and hooks here.
+  if [[ -n $(find "$g/modules" -name config -type f -print -quit 2>/dev/null) ]]; then
+    warn "$g/modules has submodule repositories; their config and hooks are writable by the agent. Check them before using git on the host"
+  fi
+  # A linked worktree's commondir normally names this .git ("../.."); its
+  # config.worktree is read when extensions.worktreeConfig is on.
+  for d in "$g"/worktrees/*/; do
+    if [[ -e $d/commondir && $(cat "$d/commondir" 2>/dev/null) != ../.. ]]; then
+      warn "${d%/}/commondir names another directory; git in that worktree reads config and hooks from there"
+    fi
+    if [[ -e $d/config.worktree ]] && git_worktree_config "$g"; then
+      warn "${d%/}/config.worktree is writable by the agent; check it before using git in that worktree"
+    fi
+  done
+  if git_worktree_config "$g"; then
+    label=$(podman container inspect --format '{{index .Config.Labels "paddock.git-worktree-config"}}' "$(agent_ctr "$name")" 2>/dev/null || true)
+    [[ $label == protected ]] \
+      || warn "$g/config.worktree is not mounted read-only in '$name' (extensions.worktreeConfig set after the instance?); run 'paddock recreate $name'"
   fi
   return 0
 }
@@ -692,6 +744,7 @@ create_containers() {
   if envf=$(data_file "tools/$tool/env"); then tenv=(--env-file "$envf"); fi
   mapfile -t gitv < <(git_mount_args "$ws")
   ((${#gitv[@]})) && gitv+=(--label paddock.git=protected)
+  [[ " ${gitv[*]} " == *":/workspace/.git/config.worktree:"* ]] && gitv+=(--label paddock.git-worktree-config=protected)
   local purl
   purl="http://$(proxy_ctr "$name"):$PROXY_PORT"
   podman create --name "$(agent_ctr "$name")" "${common[@]}" "${alimits[@]}" \
