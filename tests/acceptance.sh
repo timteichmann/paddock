@@ -300,7 +300,11 @@ check "Claude Code's managed CLAUDE.md is PADDOCK.md" ax t3 sh -c 'test "$(sha25
 check_not "agent cannot change it" ax t3 sh -c 'echo x >> /etc/claude-code/CLAUDE.md'
 check "PADDOCK_INSTANCE is set in the agent" test "$(ax t3 printenv PADDOCK_INSTANCE)" = t3
 check "rm t3" pd rm t3 --force
-check "create --no-agents-md still works (ignored, warns)" bash -c "'$PADDOCK' create claude t3 '$WS3' --no-agents-md 2>&1 | grep -q 'no longer needed'"
+# Output captured first: with `| grep -q`, paddock would die of SIGPIPE
+# mid-create once grep has matched the early warning.
+out=$(pd create claude t3 "$WS3" --no-agents-md 2>&1); rc=$?
+check "create --no-agents-md still works" test "$rc" -eq 0
+check "... and warns that it is ignored" grep -q 'no longer needed' <<<"$out"
 check "rm t3" pd rm t3 --force
 rm -rf "$WS3"
 
